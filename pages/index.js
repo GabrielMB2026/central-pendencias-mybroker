@@ -108,32 +108,31 @@ function parseValor(raw) {
 
 function parseData(raw) {
   if (!raw) return '';
-  // String no formato DD/MM/YYYY ou DD/MM/YY (vindo direto do CSV como texto)
-  if (typeof raw === 'string') {
-    const s = raw.trim();
-    // Já está no formato brasileiro DD/MM/YYYY — retorna direto
-    const mBR = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-    if (mBR) {
-      const [, d, m, y] = mBR;
-      const ano = y.length === 2 ? '20' + y : y;
-      return d.padStart(2,'0') + '/' + m.padStart(2,'0') + '/' + ano;
-    }
-    // Formato YYYY-MM-DD (ISO)
-    const mISO = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (mISO) return mISO[3] + '/' + mISO[2] + '/' + mISO[1];
-    // Se for número em string (serial do Excel vindo como texto)
-    if (/^\d+$/.test(s)) {
-      const d = XLSX.SSF.parse_date_code(Number(s));
-      if (d) return String(d.d).padStart(2,'0') + '/' + String(d.m).padStart(2,'0') + '/' + d.y;
-    }
-    return s; // devolve como veio
+  const s = String(raw).trim();
+
+  // Formato brasileiro DD/MM/YYYY ou DD/MM/YY — retorna direto
+  const mBR = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (mBR) {
+    const [, d, m, y] = mBR;
+    const ano = y.length === 2 ? '20' + y : y;
+    return d.padStart(2, '0') + '/' + m.padStart(2, '0') + '/' + ano;
   }
-  // Número serial do Excel (célula formatada como data no .xlsx)
-  if (typeof raw === 'number') {
-    const d = XLSX.SSF.parse_date_code(raw);
-    if (d) return String(d.d).padStart(2,'0') + '/' + String(d.m).padStart(2,'0') + '/' + d.y;
+
+  // Formato ISO YYYY-MM-DD
+  const mISO = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (mISO) return mISO[3] + '/' + mISO[2] + '/' + mISO[1];
+
+  // Serial numérico do Excel — inteiro ou decimal (ex: 46326.99967592592).
+  // O ERP My Broker exporta datas com fração de hora no CSV.
+  // Math.floor() descarta a fração e retorna a data correta.
+  const num = parseFloat(s);
+  if (!isNaN(num) && num > 40000 && num < 60000) {
+    const serial = Math.floor(num);
+    const d = XLSX.SSF.parse_date_code(serial);
+    if (d) return String(d.d).padStart(2, '0') + '/' + String(d.m).padStart(2, '0') + '/' + d.y;
   }
-  return String(raw);
+
+  return s;
 }
 
 function fmt(v) {
