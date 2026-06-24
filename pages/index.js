@@ -280,44 +280,70 @@ export default function Home() {
     const file = e.target.files[0];
     if (!file) return;
     setFileName(file.name);
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const data = new Uint8Array(ev.target.result);
+    const isCsv = file.name.toLowerCase().endsWith('.csv');
 
-      // ── Detecção e correção de encoding Windows-1252 ──
-      // ERPs legados brasileiros exportam CSV em Windows-1252 (cp1252).
-      // Quando lido como UTF-8, acentos ficam quebrados: "NÃO" → "NÃƒO".
-      // Estratégia: tenta ler como UTF-8 primeiro; se detectar mojibake
-      // (padrão Ã seguido de caractere cp1252), relê como Windows-1252.
-      function fixEncoding(uint8arr) {
-        const utf8 = new TextDecoder('utf-8').decode(uint8arr);
-        // Detecta sequências típicas de mojibake cp1252→utf8
-        const isMojibake = /Ã[£¢§¡©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿƒ‰]/.test(utf8);
-        if (isMojibake) {
-          // Relê o buffer como Windows-1252
-          return new TextDecoder('windows-1252').decode(uint8arr);
+    if (isCsv) {
+      // ── CSV: lê diretamente como texto, sem passar pelo XLSX ──
+      // O XLSX.js converte datas automaticamente ao ler CSV, interpretando
+      // DD/MM/YYYY como MM/DD (padrão americano) e gerando seriais errados.
+      // Solução: parsear o CSV manualmente para preservar os valores originais.
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const bytes = new Uint8Array(ev.target.result);
+        // Detecta encoding: tenta UTF-8, cai em Windows-1252 se houver mojibake
+        let texto = new TextDecoder('utf-8').decode(bytes);
+        if (/Ã[£¢§¡¨©ª«¬­®°±²³´µ¶·¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿƒ]/.test(texto)) {
+          texto = new TextDecoder('windows-1252').decode(bytes);
         }
-        return utf8;
-      }
+        parseCsvTexto(texto);
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      // ── XLSX/XLS: usa o XLSX.js normalmente com raw:true para não converter datas ──
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const data = new Uint8Array(ev.target.result);
+        const wb = XLSX.read(data, { type: 'array', raw: true, cellDates: false });
+        processWorkbook(wb);
+      };
+      reader.readAsArrayBuffer(file);
+    }
+  }
 
-      // Para CSV: lê como texto com encoding corrigido
-      const isCsv = file.name.toLowerCase().endsWith('.csv');
-      if (isCsv) {
-        const textoCorrigido = fixEncoding(data);
-        const wb = XLSX.read(textoCorrigido, { type: 'string' });
-        processWorkbook(wb);
+  function parseCsvTexto(texto) {
+    // Parser CSV simples mas robusto: suporta campos entre aspas e vírgulas dentro de campos
+    const linhas = [];
+    let campo = '', campos = [], dentroAspas = false;
+    for (let i = 0; i < texto.length; i++) {
+      const c = texto[i];
+      if (c === '"') {
+        if (dentroAspas && texto[i+1] === '"') { campo += '"'; i++; }
+        else dentroAspas = !dentroAspas;
+      } else if (c === ',' && !dentroAspas) {
+        campos.push(campo); campo = '';
+      } else if ((c === '\n' || c === '\r') && !dentroAspas) {
+        campos.push(campo); campo = '';
+        if (campos.some(f => f.trim())) linhas.push(campos);
+        campos = [];
+        if (c === '\r' && texto[i+1] === '\n') i++;
       } else {
-        // Para .xlsx/.xls: o XLSX.js cuida do encoding internamente
-        const wb = XLSX.read(data, { type: 'array' });
-        processWorkbook(wb);
+        campo += c;
       }
-    };
-    reader.readAsArrayBuffer(file);
+    }
+    if (campo || campos.length) { campos.push(campo); if (campos.some(f => f.trim())) linhas.push(campos); }
+    if (linhas.length < 2) { alert('Arquivo vazio ou sem dados.'); return; }
+    const cols = linhas[0].map(String);
+    const rows = linhas.slice(1).filter(r => r.some(c => String(c).trim() !== ''));
+    setDetectedCols(cols); setImportedRows(rows); setPreviewRows(linhas.slice(1, 6));
+    const initialMap = {};
+    cols.forEach((col, i) => { initialMap[i] = guessField(col); });
+    setMapping(initialMap);
   }
 
   function processWorkbook(wb) {
     const ws = wb.Sheets[wb.SheetNames[0]];
-    const json = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    // raw:true garante que todos os valores chegam como string, sem conversão automática de data
+    const json = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
     if (!json || json.length < 2) { alert('Arquivo vazio ou sem dados.'); return; }
     const cols = json[0].map(String);
     const rows = json.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''));
