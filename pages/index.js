@@ -86,9 +86,13 @@ const HEURISTICS = {
   valor: ['valor', 'value', 'total', 'vlr', 'vl'],
 };
 
+// Colunas derivadas de data que devem ser SEMPRE ignoradas
+// (Mês, Ano, Mês/Ano são redundantes — só queremos a coluna "Data" completa)
+const COLUNAS_IGNORAR_EXATAS = ['mes', 'ano', 'mes/ano', 'cliente', 'tipo', 'status'];
+
 function guessField(col) {
   const lc = col.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  if (lc === 'cliente') return 'ignorar';
+  if (COLUNAS_IGNORAR_EXATAS.includes(lc)) return 'ignorar';
   for (const [k, kws] of Object.entries(HEURISTICS)) {
     if (kws.some((kw) => lc.includes(kw))) return k;
   }
@@ -104,9 +108,30 @@ function parseValor(raw) {
 
 function parseData(raw) {
   if (!raw) return '';
+  // String no formato DD/MM/YYYY ou DD/MM/YY (vindo direto do CSV como texto)
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    // Já está no formato brasileiro DD/MM/YYYY — retorna direto
+    const mBR = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (mBR) {
+      const [, d, m, y] = mBR;
+      const ano = y.length === 2 ? '20' + y : y;
+      return d.padStart(2,'0') + '/' + m.padStart(2,'0') + '/' + ano;
+    }
+    // Formato YYYY-MM-DD (ISO)
+    const mISO = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (mISO) return mISO[3] + '/' + mISO[2] + '/' + mISO[1];
+    // Se for número em string (serial do Excel vindo como texto)
+    if (/^\d+$/.test(s)) {
+      const d = XLSX.SSF.parse_date_code(Number(s));
+      if (d) return String(d.d).padStart(2,'0') + '/' + String(d.m).padStart(2,'0') + '/' + d.y;
+    }
+    return s; // devolve como veio
+  }
+  // Número serial do Excel (célula formatada como data no .xlsx)
   if (typeof raw === 'number') {
     const d = XLSX.SSF.parse_date_code(raw);
-    if (d) return String(d.d).padStart(2, '0') + '/' + String(d.m).padStart(2, '0') + '/' + d.y;
+    if (d) return String(d.d).padStart(2,'0') + '/' + String(d.m).padStart(2,'0') + '/' + d.y;
   }
   return String(raw);
 }
@@ -259,18 +284,48 @@ export default function Home() {
     const reader = new FileReader();
     reader.onload = (ev) => {
       const data = new Uint8Array(ev.target.result);
-      const wb = XLSX.read(data, { type: 'array' });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const json = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-      if (!json || json.length < 2) { alert('Arquivo vazio ou sem dados.'); return; }
-      const cols = json[0].map(String);
-      const rows = json.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''));
-      setDetectedCols(cols); setImportedRows(rows); setPreviewRows(json.slice(1, 6));
-      const initialMap = {};
-      cols.forEach((col, i) => { initialMap[i] = guessField(col); });
-      setMapping(initialMap);
+
+      // ── Detecção e correção de encoding Windows-1252 ──
+      // ERPs legados brasileiros exportam CSV em Windows-1252 (cp1252).
+      // Quando lido como UTF-8, acentos ficam quebrados: "NÃO" → "NÃƒO".
+      // Estratégia: tenta ler como UTF-8 primeiro; se detectar mojibake
+      // (padrão Ã seguido de caractere cp1252), relê como Windows-1252.
+      function fixEncoding(uint8arr) {
+        const utf8 = new TextDecoder('utf-8').decode(uint8arr);
+        // Detecta sequências típicas de mojibake cp1252→utf8
+        const isMojibake = /Ã[£¢§¡©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿƒ‰]/.test(utf8);
+        if (isMojibake) {
+          // Relê o buffer como Windows-1252
+          return new TextDecoder('windows-1252').decode(uint8arr);
+        }
+        return utf8;
+      }
+
+      // Para CSV: lê como texto com encoding corrigido
+      const isCsv = file.name.toLowerCase().endsWith('.csv');
+      if (isCsv) {
+        const textoCorrigido = fixEncoding(data);
+        const wb = XLSX.read(textoCorrigido, { type: 'string' });
+        processWorkbook(wb);
+      } else {
+        // Para .xlsx/.xls: o XLSX.js cuida do encoding internamente
+        const wb = XLSX.read(data, { type: 'array' });
+        processWorkbook(wb);
+      }
     };
     reader.readAsArrayBuffer(file);
+  }
+
+  function processWorkbook(wb) {
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const json = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (!json || json.length < 2) { alert('Arquivo vazio ou sem dados.'); return; }
+    const cols = json[0].map(String);
+    const rows = json.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''));
+    setDetectedCols(cols); setImportedRows(rows); setPreviewRows(json.slice(1, 6));
+    const initialMap = {};
+    cols.forEach((col, i) => { initialMap[i] = guessField(col); });
+    setMapping(initialMap);
   }
 
   function getMappingByField() {
