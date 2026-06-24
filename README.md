@@ -14,7 +14,8 @@ O time financeiro da franqueadora precisava acompanhar, priorizar e resolver pen
 
 Uma aplicação web interna que centraliza todas as pendências financeiras da rede, com controle de status, responsáveis, histórico de ações e funcionalidades de gestão em massa.
 
-![Screenshot da aplicação](./screenshots/dashboard.png)
+<img width="1351" height="542" alt="image" src="https://github.com/user-attachments/assets/82e0e8c2-cac1-4862-82d0-8c56ecc89174" />
+
 > *Interface de gestão com filtros por empresa, status e responsável*
 
 ---
