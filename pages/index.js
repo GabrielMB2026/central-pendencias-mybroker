@@ -121,6 +121,83 @@ function nextId(existing) {
   return 'PND-'+String(max+1).padStart(3,'0');
 }
 
+// ── Utilitários de SLA de resolução ──
+// IMPORTANTE: a "Data Receb." é a data em que o valor já caiu na conta
+// (recebimento confirmado) — não é prazo de vencimento. A pendência aqui
+// é o trabalho de identificação/regularização que a equipe precisa fazer.
+// O SLA, portanto, é sobre prazo de RESPOSTA da equipe, contado a partir
+// da criação (ou última tratativa) da pendência — padrão configurável,
+// hoje fixado em 1 dia útil.
+
+const SLA_PADRAO_DIAS = 1; // prazo padrão para o responsável dar retorno
+
+// Converte "DD/MM" (sem ano, como aparece no histórico) em Date,
+// assumindo o ano corrente. Usado só para cálculos internos de SLA.
+function parseDataCurta(s) {
+  if (!s) return null;
+  const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})/);
+  if (!m) return null;
+  const anoAtual = new Date().getFullYear();
+  const dt = new Date(anoAtual, parseInt(m[2],10)-1, parseInt(m[1],10));
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+// Data da última movimentação registrada no histórico (criação ou tratativa mais recente)
+function dataUltimaMovimentacao(historico) {
+  if (!historico || !historico.length) return null;
+  return parseDataCurta(historico[historico.length - 1]);
+}
+
+// Data de criação (primeira linha do histórico)
+function dataCriacaoDoHistorico(historico) {
+  if (!historico || !historico.length) return null;
+  return parseDataCurta(historico[0]);
+}
+
+// Data em que a pendência foi marcada como Resolvida (procura no histórico)
+function dataResolucaoDoHistorico(historico) {
+  if (!historico || !historico.length) return null;
+  for (let i = historico.length - 1; i >= 0; i--) {
+    if (/resolvid/i.test(String(historico[i]))) return parseDataCurta(historico[i]);
+  }
+  return null;
+}
+
+// Quantos dias se passaram desde a última movimentação (criação ou tratativa)
+function diasDesdeUltimaMovimentacao(p) {
+  const dt = dataUltimaMovimentacao(p.historico) || dataCriacaoDoHistorico(p.historico);
+  if (!dt) return null;
+  const hoje = new Date(); hoje.setHours(0,0,0,0);
+  dt.setHours(0,0,0,0);
+  return Math.round((hoje - dt) / 86400000);
+}
+
+// Determina o status "efetivo": se a pendência está aberta (não resolvida)
+// e já passou do prazo de SLA sem nova movimentação, considera Atrasada
+// automaticamente — sem precisar marcar manualmente.
+function statusEfetivo(p) {
+  if (p.status === 'Resolvida') return 'Resolvida';
+  const dias = diasDesdeUltimaMovimentacao(p);
+  if (dias !== null && dias > SLA_PADRAO_DIAS) return 'Atrasada';
+  return p.status;
+}
+
+// Calcula SLA médio real (em dias) das pendências já resolvidas:
+// tempo entre a criação e a marcação como Resolvida.
+function calcularSlaMedia(pendencias) {
+  const tempos = [];
+  pendencias.filter(p => p.status === 'Resolvida').forEach(p => {
+    const inicio = dataCriacaoDoHistorico(p.historico);
+    const fim = dataResolucaoDoHistorico(p.historico);
+    if (inicio && fim) {
+      const dias = Math.round((fim - inicio) / 86400000);
+      if (dias >= 0) tempos.push(dias);
+    }
+  });
+  if (!tempos.length) return null;
+  return Math.round((tempos.reduce((a,b)=>a+b,0) / tempos.length) * 10) / 10;
+}
+
 export default function Home({ sessao }) {
   const router = useRouter();
   const [perfil, setPerfil] = useState(null);
@@ -189,16 +266,17 @@ export default function Home({ sessao }) {
   const filtered = pendencias.filter(p=>{
     const b=busca.toLowerCase();
     const bOk=!b||[p.pagador,p.empreendimento,p.proposta,p.loja,p.id].some(x=>(x||'').toLowerCase().includes(b));
-    return bOk&&(!fStatus||p.status===fStatus)&&(!fTipo||p.tipo===fTipo);
+    return bOk&&(!fStatus||statusEfetivo(p)===fStatus)&&(!fTipo||p.tipo===fTipo);
   });
 
   const metrics = {
     total:pendencias.length,
-    pend:pendencias.filter(p=>p.status==='Pendente').length,
-    and:pendencias.filter(p=>p.status==='Em andamento').length,
-    atr:pendencias.filter(p=>p.status==='Atrasada').length,
+    pend:pendencias.filter(p=>statusEfetivo(p)==='Pendente').length,
+    and:pendencias.filter(p=>statusEfetivo(p)==='Em andamento').length,
+    atr:pendencias.filter(p=>statusEfetivo(p)==='Atrasada').length,
     res:pendencias.filter(p=>p.status==='Resolvida').length,
     val:pendencias.reduce((a,p)=>a+Number(p.valor),0),
+    slaMedia: calcularSlaMedia(pendencias),
   };
 
   // ── Seleção múltipla ──
@@ -341,7 +419,12 @@ export default function Home({ sessao }) {
     if(editingId){
       const existing=pendencias.find(p=>p.id===editingId);
       const novoHist=[...(existing.historico||[])];
-      novoHist.push(histNew?`${dateStr} - ${histNew} (${nomeResponsavel})`:`${dateStr} - Atualizado por ${nomeResponsavel}`);
+      const mudouParaResolvida = existing.status!=='Resolvida' && form.status==='Resolvida';
+      if (mudouParaResolvida) {
+        novoHist.push(`${dateStr} - Marcado como Resolvida por ${nomeResponsavel}${histNew?' — '+histNew:''}`);
+      } else {
+        novoHist.push(histNew?`${dateStr} - ${histNew} (${nomeResponsavel})`:`${dateStr} - Atualizado por ${nomeResponsavel}`);
+      }
       const {error}=await supabase.from('pendencias').update({
         loja:form.loja||'',pagador:form.pagador||'',empreendimento:form.empreendimento||'',
         proposta:form.proposta||'',data_receb:form.dataReceb||'',valor:parseFloat(form.valor)||0,
@@ -467,16 +550,33 @@ export default function Home({ sessao }) {
 
       {/* METRICS */}
       <div className="metrics-section">
-        <div className="metrics-eyebrow">Visão geral · atualizado agora</div>
+        <div className="metrics-eyebrow">Visão geral · clique em um status para filtrar</div>
         <div className="metrics">
-          <div className="metric total"><div className="metric-num">∑</div><div className="metric-lbl">Total</div><div className="metric-val">{metrics.total}</div></div>
-          <div className="metric pend"><div className="metric-num">P</div><div className="metric-lbl">Pendentes</div><div className="metric-val yellow">{metrics.pend}</div></div>
-          <div className="metric and"><div className="metric-num">A</div><div className="metric-lbl">Em andamento</div><div className="metric-val">{metrics.and}</div></div>
-          <div className="metric atr"><div className="metric-num">!</div><div className="metric-lbl">Atrasadas</div><div className="metric-val danger">{metrics.atr}</div></div>
-          <div className="metric res"><div className="metric-num">✓</div><div className="metric-lbl">Resolvidas</div><div className="metric-val green">{metrics.res}</div></div>
-          <div className="metric val"><div className="metric-num">R$</div><div className="metric-lbl">Valor Total</div><div className="metric-val sm">{fmt(metrics.val)}</div></div>
+          <div className={'metric total clickable'+(fStatus===''?' active':'')} onClick={()=>setFStatus('')} title="Mostrar todos os status">
+            <div className="metric-num">∑</div><div className="metric-lbl">Total</div><div className="metric-val">{metrics.total}</div>
+          </div>
+          <div className={'metric pend clickable'+(fStatus==='Pendente'?' active':'')} onClick={()=>setFStatus(fStatus==='Pendente'?'':'Pendente')} title="Filtrar por Pendente">
+            <div className="metric-num">P</div><div className="metric-lbl">Pendentes</div><div className="metric-val yellow">{metrics.pend}</div>
+          </div>
+          <div className={'metric and clickable'+(fStatus==='Em andamento'?' active':'')} onClick={()=>setFStatus(fStatus==='Em andamento'?'':'Em andamento')} title="Filtrar por Em andamento">
+            <div className="metric-num">A</div><div className="metric-lbl">Em andamento</div><div className="metric-val">{metrics.and}</div>
+          </div>
+          <div className={'metric atr clickable'+(fStatus==='Atrasada'?' active':'')} onClick={()=>setFStatus(fStatus==='Atrasada'?'':'Atrasada')} title="Filtrar por Atrasada (sem retorno dentro do SLA)">
+            <div className="metric-num">!</div><div className="metric-lbl">Atrasadas</div><div className="metric-val danger">{metrics.atr}</div>
+          </div>
+          <div className={'metric res clickable'+(fStatus==='Resolvida'?' active':'')} onClick={()=>setFStatus(fStatus==='Resolvida'?'':'Resolvida')} title="Filtrar por Resolvida">
+            <div className="metric-num">✓</div><div className="metric-lbl">Resolvidas</div><div className="metric-val green">{metrics.res}</div>
+          </div>
+          <div className="metric sla">
+            <div className="metric-num">⏱</div><div className="metric-lbl">SLA Médio</div><div className="metric-val sm">{metrics.slaMedia !== null ? metrics.slaMedia + ' dias' : '—'}</div>
+          </div>
+          <div className="metric val">
+            <div className="metric-num">R$</div><div className="metric-lbl">Valor Total</div><div className="metric-val sm">{fmt(metrics.val)}</div>
+          </div>
         </div>
       </div>
+      <div className="sla-hint">SLA padrão: {SLA_PADRAO_DIAS} dia útil para retorno do responsável · Atrasada = sem nova movimentação dentro do prazo · SLA Médio = tempo real até a resolução</div>
+
 
       {/* TOOLBAR */}
       <div className="toolbar">
@@ -528,10 +628,14 @@ export default function Home({ sessao }) {
                   </td>
                 </tr>
               ) : filtered.map(p=>{
-                const b=badge(p.status);
+                const statusReal = statusEfetivo(p);
+                const b=badge(statusReal);
                 const sel=selecionados.has(p.id);
+                // Dias desde a última movimentação — base do SLA de resposta (não é vencimento de pagamento)
+                const diasParado = p.status!=='Resolvida' ? diasDesdeUltimaMovimentacao(p) : null;
+                const estourouSla = diasParado !== null && diasParado > SLA_PADRAO_DIAS;
                 return (
-                  <tr key={p.id} className={sel?'row-selected':''} onClick={isAdmin?()=>toggleSelecionado(p.id):undefined} style={isAdmin?{cursor:'pointer'}:{}}>
+                  <tr key={p.id} className={(sel?'row-selected ':'')+(estourouSla?'row-atrasada':'')} onClick={isAdmin?()=>toggleSelecionado(p.id):undefined} style={isAdmin?{cursor:'pointer'}:{}}>
                     {isAdmin && <td style={{textAlign:'center'}} onClick={e=>e.stopPropagation()}><input type="checkbox" className="cb" checked={sel} onChange={()=>toggleSelecionado(p.id)}/></td>}
                     <td className="id-cell" onClick={e=>e.stopPropagation()}>
                       {p.id}
@@ -544,7 +648,14 @@ export default function Home({ sessao }) {
                     <td className="prop-cell">{p.proposta||'—'}</td>
                     <td className="date-cell">{p.dataReceb||'—'}</td>
                     <td className="val-cell">{fmt(p.valor)}</td>
-                    <td><span className={'badge '+b.cls}>{b.label}</span></td>
+                    <td>
+                      <span className={'badge '+b.cls}>{b.label}</span>
+                      {diasParado !== null && diasParado >= 0 && (
+                        <span className={'sla-tag'+(estourouSla?' estourado':'')} title={`${diasParado} dia(s) sem nova movimentação · SLA padrão: ${SLA_PADRAO_DIAS} dia(s)`}>
+                          {estourouSla ? `${diasParado}d sem retorno` : `${diasParado}d`}
+                        </span>
+                      )}
+                    </td>
                     <td style={{fontSize:11}}>{p.responsavel||<span style={{color:'var(--muted)',fontStyle:'italic'}}>a definir</span>}</td>
                     <td style={{fontSize:11,color:'var(--text2)'}}><div className="ellipsis" style={{maxWidth:140}} title={p.acao}>{p.acao||'—'}</div></td>
                     <td style={{whiteSpace:'nowrap',display:'flex',gap:3,paddingTop:8}} onClick={e=>e.stopPropagation()}>
@@ -633,6 +744,27 @@ export default function Home({ sessao }) {
         .chip-danger{background:var(--danger)!important;color:#fff!important;border-color:var(--danger)!important;}
         .chip-danger:hover{background:#c0102a!important;}
         .chip-danger:disabled{opacity:.6;cursor:not-allowed;}
+
+        /* ── SLA de resposta / Atraso automático ── */
+        .metric.sla{border-color:#8A96B0;}
+        .sla-hint{background:var(--navy);padding:0 24px 14px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;color:rgba(255,255,255,.3);}
+
+        tr.row-atrasada td{background:rgba(232,51,74,.04);}
+        tr.row-atrasada:hover td{background:rgba(232,51,74,.08)!important;}
+        tr.row-atrasada .id-cell{border-left:3px solid var(--danger);padding-left:8px;}
+
+        .sla-tag{
+          display:inline-block; margin-left:6px;
+          font-family:'DM Mono',monospace; font-size:8px; letter-spacing:1px; text-transform:uppercase;
+          padding:1px 5px; color:var(--muted); background:rgba(138,150,176,.12);
+        }
+        .sla-tag.estourado{background:rgba(232,51,74,.15); color:var(--danger); font-weight:700;}
+
+        /* ── Cards de status clicáveis (filtro rápido) ── */
+        .metric.clickable{cursor:pointer; transition:transform .12s, background .15s;}
+        .metric.clickable:hover{background:rgba(255,255,255,.09);}
+        .metric.clickable:active{transform:scale(.97);}
+        .metric.active{outline:2px solid var(--yellow); outline-offset:-2px;}
       `}</style>
     </>
   );
