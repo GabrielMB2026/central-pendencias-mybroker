@@ -487,6 +487,7 @@ export default function Home({ sessao }) {
             <span className="user-nome">{perfil?.nome||sessao?.user?.email}</span>
             <span className={'user-role '+(isAdmin?'role-admin':'role-editor')}>{isAdmin?'admin':'editor'}</span>
             {isAdmin && <button className="user-btn" onClick={()=>router.push('/admin')} title="Gerenciar usuários">⚙</button>}
+            <button className="user-btn" onClick={()=>router.push('/dashboard')} title="Dashboard">📊</button>
             <button className="user-btn" onClick={handleLogout} title="Sair">⏻</button>
           </div>
         </div>
@@ -731,6 +732,7 @@ export default function Home({ sessao }) {
         <div className="footer-info">My Broker Imóveis · CSC Financeiro · Central de Pendências</div>
         <div className="footer-actions">
           {isAdmin && <button className="footer-btn" onClick={()=>setImportOpen(v=>!v)}>↓ importar erp</button>}
+          <button className="footer-btn" onClick={()=>router.push('/dashboard')}>📊 dashboard</button>
           <button className="footer-btn" onClick={exportExcel}>↑ exportar xlsx</button>
           {isAdmin && <button className="footer-btn" onClick={()=>openModal(null)}>+ nova pendência</button>}
           <button className="footer-btn" onClick={handleLogout}>⏻ sair</button>
