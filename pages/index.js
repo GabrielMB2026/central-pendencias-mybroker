@@ -14,27 +14,33 @@ function parseCamposERP(raw) {
   let limpo = s.replace(/^Recebimentos\s*\[[^\]]*\]\s*-?\s*/i,'').trim().replace(/`/g,'').trim();
   if (!limpo) return result;
 
-  // ── Extrai o que está APÓS O ÚLTIMO TRAÇO como observação ──
-  const ultimoTraco = limpo.lastIndexOf(' - ');
-  if (ultimoTraco !== -1) {
-    const candidato = limpo.slice(ultimoTraco + 3).trim();
+  // ── Extrai o que está APÓS O ÚLTIMO SEPARADOR ( - ou / ) como observação ──
+  // Encontra a última ocorrência de " - " ou " / " (com espaços) no texto
+  const sepRegex = /\s+[-\/]\s+/g;
+  let ultimoMatch = null;
+  let m;
+  while ((m = sepRegex.exec(limpo)) !== null) ultimoMatch = m;
+
+  if (ultimoMatch) {
+    const candidato = limpo.slice(ultimoMatch.index + ultimoMatch[0].length).trim();
     if (candidato.length > 2) {
       result.obsFinale = candidato;
-      limpo = limpo.slice(0, ultimoTraco).trim();
+      limpo = limpo.slice(0, ultimoMatch.index).trim();
     }
   }
 
   // Remove unidade do final do que sobrou
   let unidade = '';
-  const um = limpo.match(/^(.*?)\s*-?\s*(Unidade\s+.*?(?:Bl\/?Qd\s*[\w\-]*)?)\s*$/i);
+  const um = limpo.match(/^(.*?)\s*[-\/]?\s*(Unidade\s+.*?(?:Bl\/?Qd\s*[\w\-]*)?)\s*$/i);
   if (um && um[2]) { unidade = um[2].trim(); limpo = um[1].trim(); }
   result.unidade = unidade;
-  limpo = limpo.replace(/[-\/]\s*$/,'').trim();
+  limpo = limpo.replace(/\s+[-\/]\s*$/,'').trim();
 
   const mProp = limpo.match(/^proposta\s*[:\-]?\s*(\d+)\s*$/i);
   if (mProp) { result.proposta = mProp[1]; result.confianca = 'alta'; return result; }
 
-  const blocos = limpo.split(/\s+-\s+/).map(b=>b.trim()).filter(Boolean);
+  // Divide por " - " ou " / " para extrair os demais campos
+  const blocos = limpo.split(/\s+[-\/]\s+/).map(b=>b.trim()).filter(Boolean);
   if (!blocos.length) return result;
 
   function extraiProposta(bloco) {
@@ -621,7 +627,7 @@ export default function Home({ sessao }) {
                 {isAdmin && <th style={{width:40,textAlign:'center'}}><input type="checkbox" className="cb" checked={todosVisivelsSelecionados} onChange={toggleTodos}/></th>}
                 <th>ID</th><th>C.Custo / Loja</th><th>Pagador</th><th>Empreendimento</th>
                 <th>Proposta</th><th>Data Receb.</th><th>Valor</th>
-                <th>Status</th><th>Observação</th><th></th>
+                <th>Observação</th><th></th>
               </tr>
             </thead>
             <tbody>
