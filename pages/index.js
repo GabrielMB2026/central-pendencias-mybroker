@@ -7,27 +7,36 @@ import { supabase } from '../lib/supabase';
 /* ── Parser ERP ── */
 function parseCamposERP(raw) {
   const s = String(raw || '').trim();
-  const result = { pagador:'', proposta:'', empreendimento:'', unidade:'', statusVenda:'', confianca:'baixa' };
+  const result = { pagador:'', proposta:'', empreendimento:'', unidade:'', obsFinale:'', confianca:'baixa' };
   if (!s) return result;
+
+  // Remove prefixo "Recebimentos [xxx] -" e backticks
   let limpo = s.replace(/^Recebimentos\s*\[[^\]]*\]\s*-?\s*/i,'').trim().replace(/`/g,'').trim();
   if (!limpo) return result;
-  let statusVenda = '';
-  const vm = limpo.match(/VENDA\s+NA\s+ABA[:\-]?\s*(.+)$/i);
-  if (vm) { statusVenda = 'Venda na aba: ' + vm[1].trim(); limpo = limpo.slice(0,vm.index).trim(); }
-  const pm = limpo.match(/\(([^)]+)\)\s*$/);
-  if (pm) { statusVenda = (statusVenda ? statusVenda+' · ':'')+pm[1].trim(); limpo = limpo.slice(0,pm.index).trim(); }
-  result.statusVenda = statusVenda;
-  limpo = limpo.replace(/[-\/]\s*$/,'').trim();
-  if (!limpo) return result;
+
+  // ── Extrai o que está APÓS O ÚLTIMO TRAÇO como observação ──
+  const ultimoTraco = limpo.lastIndexOf(' - ');
+  if (ultimoTraco !== -1) {
+    const candidato = limpo.slice(ultimoTraco + 3).trim();
+    if (candidato.length > 2) {
+      result.obsFinale = candidato;
+      limpo = limpo.slice(0, ultimoTraco).trim();
+    }
+  }
+
+  // Remove unidade do final do que sobrou
   let unidade = '';
   const um = limpo.match(/^(.*?)\s*-?\s*(Unidade\s+.*?(?:Bl\/?Qd\s*[\w\-]*)?)\s*$/i);
   if (um && um[2]) { unidade = um[2].trim(); limpo = um[1].trim(); }
   result.unidade = unidade;
   limpo = limpo.replace(/[-\/]\s*$/,'').trim();
+
   const mProp = limpo.match(/^proposta\s*[:\-]?\s*(\d+)\s*$/i);
   if (mProp) { result.proposta = mProp[1]; result.confianca = 'alta'; return result; }
+
   const blocos = limpo.split(/\s+-\s+/).map(b=>b.trim()).filter(Boolean);
   if (!blocos.length) return result;
+
   function extraiProposta(bloco) {
     let m = bloco.match(/^(.*?)[\/]\s*(\d{5,})\s*$/);
     if (m) return { nome:m[1].trim(), prop:m[2] };
@@ -39,11 +48,13 @@ function parseCamposERP(raw) {
     if (m) return { nome:m[2]?m[2].trim():'', prop:m[1] };
     return null;
   }
+
   const ep0 = extraiProposta(blocos[0]);
   if (ep0 && ep0.nome) { result.pagador=ep0.nome; result.proposta=ep0.prop; result.confianca='alta'; }
   else if (ep0 && !ep0.nome) { result.proposta=ep0.prop; result.confianca='media'; }
   else if (/^proposta$/i.test(blocos[0])) { result.confianca='baixa'; }
   else { result.pagador=blocos[0]; result.confianca='media'; }
+
   for (let i=1;i<blocos.length;i++) {
     const epi = extraiProposta(blocos[i]);
     if (epi) { if(epi.prop&&!result.proposta)result.proposta=epi.prop; if(epi.nome&&!result.empreendimento)result.empreendimento=epi.nome; continue; }
@@ -54,15 +65,20 @@ function parseCamposERP(raw) {
   return result;
 }
 
-function extrairObsERP(raw) {
-  const r = parseCamposERP(raw);
-  return [r.unidade, r.statusVenda].filter(Boolean).join(' · ');
+// Observação final: o que vem após o último " - " no campo Contrato.
+// Fallback: coluna Descrição da planilha importada.
+function extrairObsERP(rawContrato, rawDescricao) {
+  const parsed = parseCamposERP(rawContrato);
+  if (parsed.obsFinale) return parsed.obsFinale;
+  const desc = String(rawDescricao || '').trim();
+  if (desc) return desc;
+  return '';
 }
 
 const CAMPOS_DESTINO = [
   { key:'ccusto', label:'C.Custo / Loja' },
   { key:'contrato', label:'Contrato (texto rico — será separado automaticamente)' },
-  { key:'descricao', label:'Descrição (obs)' },
+  { key:'descricao', label:'Descrição (obs — fallback se Contrato não tiver obs)' },
   { key:'pagador', label:'Pagador (já separado)' },
   { key:'empreendimento', label:'Empreendimento (já separado)' },
   { key:'proposta', label:'Proposta (já separado)' },
@@ -121,18 +137,8 @@ function nextId(existing) {
   return 'PND-'+String(max+1).padStart(3,'0');
 }
 
-// ── Utilitários de SLA de resolução ──
-// IMPORTANTE: a "Data Receb." é a data em que o valor já caiu na conta
-// (recebimento confirmado) — não é prazo de vencimento. A pendência aqui
-// é o trabalho de identificação/regularização que a equipe precisa fazer.
-// O SLA, portanto, é sobre prazo de RESPOSTA da equipe, contado a partir
-// da criação (ou última tratativa) da pendência — padrão configurável,
-// hoje fixado em 1 dia útil.
+const SLA_PADRAO_DIAS = 1;
 
-const SLA_PADRAO_DIAS = 1; // prazo padrão para o responsável dar retorno
-
-// Converte "DD/MM" (sem ano, como aparece no histórico) em Date,
-// assumindo o ano corrente. Usado só para cálculos internos de SLA.
 function parseDataCurta(s) {
   if (!s) return null;
   const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})/);
@@ -142,19 +148,16 @@ function parseDataCurta(s) {
   return isNaN(dt.getTime()) ? null : dt;
 }
 
-// Data da última movimentação registrada no histórico (criação ou tratativa mais recente)
 function dataUltimaMovimentacao(historico) {
   if (!historico || !historico.length) return null;
   return parseDataCurta(historico[historico.length - 1]);
 }
 
-// Data de criação (primeira linha do histórico)
 function dataCriacaoDoHistorico(historico) {
   if (!historico || !historico.length) return null;
   return parseDataCurta(historico[0]);
 }
 
-// Data em que a pendência foi marcada como Resolvida (procura no histórico)
 function dataResolucaoDoHistorico(historico) {
   if (!historico || !historico.length) return null;
   for (let i = historico.length - 1; i >= 0; i--) {
@@ -163,7 +166,6 @@ function dataResolucaoDoHistorico(historico) {
   return null;
 }
 
-// Quantos dias se passaram desde a última movimentação (criação ou tratativa)
 function diasDesdeUltimaMovimentacao(p) {
   const dt = dataUltimaMovimentacao(p.historico) || dataCriacaoDoHistorico(p.historico);
   if (!dt) return null;
@@ -172,9 +174,6 @@ function diasDesdeUltimaMovimentacao(p) {
   return Math.round((hoje - dt) / 86400000);
 }
 
-// Determina o status "efetivo": se a pendência está aberta (não resolvida)
-// e já passou do prazo de SLA sem nova movimentação, considera Atrasada
-// automaticamente — sem precisar marcar manualmente.
 function statusEfetivo(p) {
   if (p.status === 'Resolvida') return 'Resolvida';
   const dias = diasDesdeUltimaMovimentacao(p);
@@ -182,8 +181,6 @@ function statusEfetivo(p) {
   return p.status;
 }
 
-// Calcula SLA médio real (em dias) das pendências já resolvidas:
-// tempo entre a criação e a marcação como Resolvida.
 function calcularSlaMedia(pendencias) {
   const tempos = [];
   pendencias.filter(p => p.status === 'Resolvida').forEach(p => {
@@ -237,7 +234,6 @@ export default function Home({ sessao }) {
     toastTimer.current = setTimeout(()=>setToast(''),3500);
   },[]);
 
-  // ── Carrega perfil do usuário logado ──
   useEffect(() => {
     if (!sessao) return;
     supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single()
@@ -279,7 +275,6 @@ export default function Home({ sessao }) {
     slaMedia: calcularSlaMedia(pendencias),
   };
 
-  // ── Seleção múltipla ──
   const todosVisivelsSelecionados = filtered.length>0&&filtered.every(p=>selecionados.has(p.id));
   function toggleSelecionado(id) {
     setSelecionados(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; });
@@ -305,7 +300,6 @@ export default function Home({ sessao }) {
     await loadPendencias(); showToast('Pendência removida.');
   }
 
-  // ── Importação CSV (lê como texto puro para preservar datas) ──
   function handleFile(e) {
     const file=e.target.files[0]; if(!file) return;
     setFileName(file.name);
@@ -367,15 +361,26 @@ export default function Home({ sessao }) {
     const dateStr=new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
     const nomeResponsavel=perfil?.nome||sessao?.user?.email||'Sistema';
     const novas=[]; let seed=[...pendencias];
+
     importedRows.forEach(row=>{
-      const cRaw=map.contrato!==undefined?String(row[map.contrato]||''):'';
-      const descRaw=map.descricao!==undefined?String(row[map.descricao]||''):'';
-      const parsed=parseCamposERP(cRaw);
-      const obsAuto=extrairObsERP(cRaw);
-      const obs=[descRaw,obsAuto,cRaw?'Texto original ERP: '+cRaw:''].filter(Boolean).join(' · ');
+      const cRaw = map.contrato!==undefined ? String(row[map.contrato]||'') : '';
+      const descRaw = map.descricao!==undefined ? String(row[map.descricao]||'') : '';
+      const parsed = parseCamposERP(cRaw);
+
+      // ── Nova lógica de obs:
+      // 1. O que vem após o último " - " no campo Contrato
+      // 2. Fallback: coluna Descrição
+      // 3. Texto original completo preservado sempre
+      const obsLida = extrairObsERP(cRaw, descRaw);
+      const partes = [];
+      if (obsLida) partes.push(obsLida);
+      if (cRaw) partes.push('ERP: ' + cRaw);
+      const obs = partes.join(' · ');
+
       const newId=nextId(seed);
       const nova={
-        id:newId, loja:map.ccusto!==undefined?String(row[map.ccusto]||''):'',
+        id:newId,
+        loja:map.ccusto!==undefined?String(row[map.ccusto]||''):'',
         pagador:map.pagador!==undefined?String(row[map.pagador]||''):parsed.pagador,
         empreendimento:map.empreendimento!==undefined?String(row[map.empreendimento]||''):parsed.empreendimento,
         proposta:map.proposta!==undefined?String(row[map.proposta]||''):parsed.proposta,
@@ -387,6 +392,7 @@ export default function Home({ sessao }) {
       };
       novas.push(nova); seed=[...seed,nova];
     });
+
     const {error}=await supabase.from('pendencias').insert(novas.map(p=>({
       id:p.id,loja:p.loja,pagador:p.pagador,empreendimento:p.empreendimento,
       proposta:p.proposta,data_receb:p.dataReceb,valor:p.valor,tipo:p.tipo,
@@ -402,7 +408,6 @@ export default function Home({ sessao }) {
     showToast(novas.length+' importada(s)! '+(rev?rev+' precisam revisão.':''));
   }
 
-  // ── Modal ──
   function openModal(id) {
     setEditingId(id);
     if(id){const p=pendencias.find(x=>x.id===id);setForm({...p});}
@@ -482,7 +487,6 @@ export default function Home({ sessao }) {
           {isAdmin && <button className="chip" onClick={()=>setImportOpen(v=>!v)}>↓ Importar ERP</button>}
           <button className="chip" onClick={exportExcel}>↑ Exportar Excel</button>
           {isAdmin && <button className="chip chip-yellow" onClick={()=>openModal(null)}>+ Nova Pendência</button>}
-          {/* Usuário logado */}
           <div className="user-pill">
             <span className="user-nome">{perfil?.nome||sessao?.user?.email}</span>
             <span className={'user-role '+(isAdmin?'role-admin':'role-editor')}>{isAdmin?'admin':'editor'}</span>
@@ -495,7 +499,7 @@ export default function Home({ sessao }) {
 
       {erro && <div style={{background:'#FEE2E2',color:'#991B1B',padding:'10px 24px',fontSize:12}}>{erro}</div>}
 
-      {/* IMPORT PANEL — só admin */}
+      {/* IMPORT PANEL */}
       {isAdmin && (
         <div className={'import-panel'+(importOpen?' open':'')}>
           <div className="import-eyebrow">Importação via planilha</div>
@@ -553,19 +557,19 @@ export default function Home({ sessao }) {
       <div className="metrics-section">
         <div className="metrics-eyebrow">Visão geral · clique em um status para filtrar</div>
         <div className="metrics">
-          <div className={'metric total clickable'+(fStatus===''?' active':'')} onClick={()=>setFStatus('')} title="Mostrar todos os status">
+          <div className={'metric total clickable'+(fStatus===''?' active':'')} onClick={()=>setFStatus('')}>
             <div className="metric-num">∑</div><div className="metric-lbl">Total</div><div className="metric-val">{metrics.total}</div>
           </div>
-          <div className={'metric pend clickable'+(fStatus==='Pendente'?' active':'')} onClick={()=>setFStatus(fStatus==='Pendente'?'':'Pendente')} title="Filtrar por Pendente">
+          <div className={'metric pend clickable'+(fStatus==='Pendente'?' active':'')} onClick={()=>setFStatus(fStatus==='Pendente'?'':'Pendente')}>
             <div className="metric-num">P</div><div className="metric-lbl">Pendentes</div><div className="metric-val yellow">{metrics.pend}</div>
           </div>
-          <div className={'metric and clickable'+(fStatus==='Em andamento'?' active':'')} onClick={()=>setFStatus(fStatus==='Em andamento'?'':'Em andamento')} title="Filtrar por Em andamento">
+          <div className={'metric and clickable'+(fStatus==='Em andamento'?' active':'')} onClick={()=>setFStatus(fStatus==='Em andamento'?'':'Em andamento')}>
             <div className="metric-num">A</div><div className="metric-lbl">Em andamento</div><div className="metric-val">{metrics.and}</div>
           </div>
-          <div className={'metric atr clickable'+(fStatus==='Atrasada'?' active':'')} onClick={()=>setFStatus(fStatus==='Atrasada'?'':'Atrasada')} title="Filtrar por Atrasada (sem retorno dentro do SLA)">
+          <div className={'metric atr clickable'+(fStatus==='Atrasada'?' active':'')} onClick={()=>setFStatus(fStatus==='Atrasada'?'':'Atrasada')}>
             <div className="metric-num">!</div><div className="metric-lbl">Atrasadas</div><div className="metric-val danger">{metrics.atr}</div>
           </div>
-          <div className={'metric res clickable'+(fStatus==='Resolvida'?' active':'')} onClick={()=>setFStatus(fStatus==='Resolvida'?'':'Resolvida')} title="Filtrar por Resolvida">
+          <div className={'metric res clickable'+(fStatus==='Resolvida'?' active':'')} onClick={()=>setFStatus(fStatus==='Resolvida'?'':'Resolvida')}>
             <div className="metric-num">✓</div><div className="metric-lbl">Resolvidas</div><div className="metric-val green">{metrics.res}</div>
           </div>
           <div className="metric sla">
@@ -576,8 +580,7 @@ export default function Home({ sessao }) {
           </div>
         </div>
       </div>
-      <div className="sla-hint">SLA padrão: {SLA_PADRAO_DIAS} dia útil para retorno do responsável · Atrasada = sem nova movimentação dentro do prazo · SLA Médio = tempo real até a resolução</div>
-
+      <div className="sla-hint">SLA padrão: {SLA_PADRAO_DIAS} dia útil · Atrasada = sem movimentação dentro do prazo · SLA Médio = tempo real até resolução</div>
 
       {/* TOOLBAR */}
       <div className="toolbar">
@@ -618,13 +621,13 @@ export default function Home({ sessao }) {
                 {isAdmin && <th style={{width:40,textAlign:'center'}}><input type="checkbox" className="cb" checked={todosVisivelsSelecionados} onChange={toggleTodos}/></th>}
                 <th>ID</th><th>C.Custo / Loja</th><th>Pagador</th><th>Empreendimento</th>
                 <th>Proposta</th><th>Data Receb.</th><th>Valor</th>
-                <th>Status</th><th>Responsável</th><th>Próxima Ação</th><th></th>
+                <th>Status</th><th>Observação</th><th></th>
               </tr>
             </thead>
             <tbody>
               {filtered.length===0 ? (
                 <tr className="empty-row">
-                  <td colSpan={isAdmin?12:11}>
+                  <td colSpan={isAdmin?11:10}>
                     {loading?'Carregando...':pendencias.length===0?'Nenhuma pendência cadastrada':'Nenhum resultado para os filtros'}
                   </td>
                 </tr>
@@ -632,9 +635,10 @@ export default function Home({ sessao }) {
                 const statusReal = statusEfetivo(p);
                 const b=badge(statusReal);
                 const sel=selecionados.has(p.id);
-                // Dias desde a última movimentação — base do SLA de resposta (não é vencimento de pagamento)
                 const diasParado = p.status!=='Resolvida' ? diasDesdeUltimaMovimentacao(p) : null;
                 const estourouSla = diasParado !== null && diasParado > SLA_PADRAO_DIAS;
+                // Extrai a observação legível do campo obs (o que vem antes do " · ERP:")
+                const obsLegivel = p.obs ? p.obs.split(' · ERP:')[0].trim() : '';
                 return (
                   <tr key={p.id} className={(sel?'row-selected ':'')+(estourouSla?'row-atrasada':'')} onClick={isAdmin?()=>toggleSelecionado(p.id):undefined} style={isAdmin?{cursor:'pointer'}:{}}>
                     {isAdmin && <td style={{textAlign:'center'}} onClick={e=>e.stopPropagation()}><input type="checkbox" className="cb" checked={sel} onChange={()=>toggleSelecionado(p.id)}/></td>}
@@ -650,8 +654,11 @@ export default function Home({ sessao }) {
                     <td className="date-cell">{p.dataReceb||'—'}</td>
                     <td className="val-cell">{fmt(p.valor)}</td>
                     <td><span className={'badge '+b.cls}>{b.label}</span></td>
-                    <td style={{fontSize:11}}>{p.responsavel||<span style={{color:'var(--muted)',fontStyle:'italic'}}>a definir</span>}</td>
-                    <td style={{fontSize:11,color:'var(--text2)'}}><div className="ellipsis" style={{maxWidth:140}} title={p.acao}>{p.acao||'—'}</div></td>
+                    <td>
+                      <div className="ellipsis obs-cell" title={obsLegivel} style={{maxWidth:200}}>
+                        {obsLegivel || <span style={{color:'var(--muted)',fontStyle:'italic'}}>—</span>}
+                      </div>
+                    </td>
                     <td style={{whiteSpace:'nowrap',display:'flex',gap:3,paddingTop:8}} onClick={e=>e.stopPropagation()}>
                       <button className="row-btn" onClick={()=>openModal(p.id)}>editar</button>
                       {isAdmin && <button className="row-btn del" onClick={()=>deletar(p.id)}>excluir</button>}
@@ -676,17 +683,16 @@ export default function Home({ sessao }) {
           </div>
           <div className="modal-body">
             <div className="form-grid">
-              <div className="fg"><label>C.Custo / Loja</label><input type="text" placeholder="Ex: RECEITA COMERCIAL LANÇAMENTO" value={form.loja||''} onChange={e=>setForm(f=>({...f,loja:e.target.value}))}/></div>
+              <div className="fg"><label>C.Custo / Loja</label><input type="text" value={form.loja||''} onChange={e=>setForm(f=>({...f,loja:e.target.value}))}/></div>
               <div className="fg"><label>Status</label><select value={form.status||'Pendente'} onChange={e=>setForm(f=>({...f,status:e.target.value}))}><option>Pendente</option><option>Em andamento</option><option>Atrasada</option><option>Resolvida</option></select></div>
-              <div className="fg"><label>Pagador</label><input type="text" placeholder="Nome completo do pagador" value={form.pagador||''} onChange={e=>setForm(f=>({...f,pagador:e.target.value}))}/></div>
-              <div className="fg"><label>Empreendimento</label><input type="text" placeholder="Ex: Lottus Residence..." value={form.empreendimento||''} onChange={e=>setForm(f=>({...f,empreendimento:e.target.value}))}/></div>
-              <div className="fg"><label>Proposta / Contrato</label><input type="text" placeholder="Nº da proposta" value={form.proposta||''} onChange={e=>setForm(f=>({...f,proposta:e.target.value}))}/></div>
+              <div className="fg"><label>Pagador</label><input type="text" value={form.pagador||''} onChange={e=>setForm(f=>({...f,pagador:e.target.value}))}/></div>
+              <div className="fg"><label>Empreendimento</label><input type="text" value={form.empreendimento||''} onChange={e=>setForm(f=>({...f,empreendimento:e.target.value}))}/></div>
+              <div className="fg"><label>Proposta / Contrato</label><input type="text" value={form.proposta||''} onChange={e=>setForm(f=>({...f,proposta:e.target.value}))}/></div>
               <div className="fg"><label>Data Receb.</label><input type="text" placeholder="DD/MM/AAAA" value={form.dataReceb||''} onChange={e=>setForm(f=>({...f,dataReceb:e.target.value}))}/></div>
-              <div className="fg"><label>Valor (R$)</label><input type="number" placeholder="0,00" min="0" step="0.01" value={form.valor??''} onChange={e=>setForm(f=>({...f,valor:e.target.value}))}/></div>
-              <div className="fg"><label>Tipo</label><select value={form.tipo||'Documentação'} onChange={e=>setForm(f=>({...f,tipo:e.target.value}))}><option>Documentação</option><option>Pagamento</option><option>Assinatura</option><option>Vistoria</option><option>Outro</option></select></div>
-              <div className="fg"><label>Responsável Atual</label><input type="text" placeholder="Nome do responsável" value={form.responsavel||''} onChange={e=>setForm(f=>({...f,responsavel:e.target.value}))}/></div>
-              <div className="fg full"><label>Próxima Ação</label><input type="text" placeholder="Descreva a próxima ação" value={form.acao||''} onChange={e=>setForm(f=>({...f,acao:e.target.value}))}/></div>
-              <div className="fg full"><label>Observações</label><textarea placeholder="Informações relevantes, tratativas, contatos..." value={form.obs||''} onChange={e=>setForm(f=>({...f,obs:e.target.value}))}/></div>
+              <div className="fg"><label>Valor (R$)</label><input type="number" min="0" step="0.01" value={form.valor??''} onChange={e=>setForm(f=>({...f,valor:e.target.value}))}/></div>
+              <div className="fg"><label>Responsável</label><input type="text" value={form.responsavel||''} onChange={e=>setForm(f=>({...f,responsavel:e.target.value}))}/></div>
+              <div className="fg full"><label>Próxima Ação</label><input type="text" value={form.acao||''} onChange={e=>setForm(f=>({...f,acao:e.target.value}))}/></div>
+              <div className="fg full"><label>Observações</label><textarea value={form.obs||''} onChange={e=>setForm(f=>({...f,obs:e.target.value}))}/></div>
               {editingId && (() => {
                 const pAtual = pendencias.find(x=>x.id===editingId);
                 const diasParado = pAtual && pAtual.status!=='Resolvida' ? diasDesdeUltimaMovimentacao(pAtual) : null;
@@ -700,10 +706,10 @@ export default function Home({ sessao }) {
                           <div className="sla-modal-valor">
                             {diasParado === 0 && 'Movimentado hoje — dentro do prazo'}
                             {diasParado === 1 && !estourou && '1 dia sem nova movimentação — dentro do prazo'}
-                            {diasParado > 1 && !estourou && `${diasParado} dias sem nova movimentação — dentro do prazo`}
-                            {estourou && `⚠ ${diasParado} dia${diasParado>1?'s':''} sem retorno — SLA estourado (prazo: ${SLA_PADRAO_DIAS} dia${SLA_PADRAO_DIAS>1?'s':''})`}
+                            {diasParado > 1 && !estourou && `${diasParado} dias sem movimentação — dentro do prazo`}
+                            {estourou && `⚠ ${diasParado} dia${diasParado>1?'s':''} sem retorno — SLA estourado`}
                           </div>
-                          <div className="sla-modal-hint">Prazo padrão para retorno: {SLA_PADRAO_DIAS} dia útil · Adicione uma tratativa no histórico para reiniciar o contador</div>
+                          <div className="sla-modal-hint">Prazo: {SLA_PADRAO_DIAS} dia útil · Adicione uma tratativa para reiniciar o contador</div>
                         </div>
                       </div>
                     )}
@@ -758,31 +764,22 @@ export default function Home({ sessao }) {
         .chip-danger{background:var(--danger)!important;color:#fff!important;border-color:var(--danger)!important;}
         .chip-danger:hover{background:#c0102a!important;}
         .chip-danger:disabled{opacity:.6;cursor:not-allowed;}
-
-        /* ── SLA de resposta / Atraso automático ── */
+        .obs-cell{font-size:11px;color:var(--text2);}
         .metric.sla{border-color:#8A96B0;}
         .sla-hint{background:var(--navy);padding:0 24px 14px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;color:rgba(255,255,255,.3);}
-
         tr.row-atrasada td{background:rgba(232,51,74,.04);}
         tr.row-atrasada:hover td{background:rgba(232,51,74,.08)!important;}
         tr.row-atrasada .id-cell{border-left:3px solid var(--danger);padding-left:8px;}
-
-        .sla-tag{display:inline-block;margin-left:6px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;padding:1px 5px;color:var(--muted);background:rgba(138,150,176,.12);}
-        .sla-tag.estourado{background:rgba(232,51,74,.15);color:var(--danger);font-weight:700;}
-
-        /* SLA box dentro do modal */
         .sla-modal-box{padding:10px 14px;background:var(--off);border-left:3px solid var(--blue);margin-top:2px;}
         .sla-modal-box.sla-estourado{background:#FEF2F2;border-left-color:var(--danger);}
         .sla-modal-label{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
         .sla-modal-valor{font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px;}
         .sla-modal-box.sla-estourado .sla-modal-valor{color:var(--danger);}
         .sla-modal-hint{font-size:11px;color:var(--muted);}
-
-        /* ── Cards de status clicáveis (filtro rápido) ── */
-        .metric.clickable{cursor:pointer; transition:transform .12s, background .15s;}
+        .metric.clickable{cursor:pointer;transition:transform .12s,background .15s;}
         .metric.clickable:hover{background:rgba(255,255,255,.09);}
         .metric.clickable:active{transform:scale(.97);}
-        .metric.active{outline:2px solid var(--yellow); outline-offset:-2px;}
+        .metric.active{outline:2px solid var(--yellow);outline-offset:-2px;}
       `}</style>
     </>
   );
