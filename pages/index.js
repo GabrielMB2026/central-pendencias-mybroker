@@ -633,7 +633,7 @@ export default function Home({ sessao }) {
             <tbody>
               {filtered.length===0 ? (
                 <tr className="empty-row">
-                  <td colSpan={isAdmin?11:10}>
+                  <td colSpan={isAdmin?10:9}>
                     {loading?'Carregando...':pendencias.length===0?'Nenhuma pendência cadastrada':'Nenhum resultado para os filtros'}
                   </td>
                 </tr>
@@ -659,7 +659,6 @@ export default function Home({ sessao }) {
                     <td className="prop-cell">{p.proposta||'—'}</td>
                     <td className="date-cell">{p.dataReceb||'—'}</td>
                     <td className="val-cell">{fmt(p.valor)}</td>
-                    <td><span className={'badge '+b.cls}>{b.label}</span></td>
                     <td>
                       <div className="ellipsis obs-cell" title={obsLegivel} style={{maxWidth:200}}>
                         {obsLegivel || <span style={{color:'var(--muted)',fontStyle:'italic'}}>—</span>}
