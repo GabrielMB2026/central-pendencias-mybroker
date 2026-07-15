@@ -9,58 +9,36 @@ function parseCamposERP(raw) {
   const s = String(raw || '').trim();
   const result = { pagador:'', proposta:'', empreendimento:'', unidade:'', obsFinale:'', confianca:'baixa' };
   if (!s) return result;
-
-  // Remove prefixo "Recebimentos [xxx] -" e backticks
   let limpo = s.replace(/^Recebimentos\s*\[[^\]]*\]\s*-?\s*/i,'').trim().replace(/`/g,'').trim();
   if (!limpo) return result;
-
-  // ── Extrai o que está APÓS O ÚLTIMO SEPARADOR ( - ou / ) como observação ──
-  // Encontra a última ocorrência de " - " ou " / " (com espaços) no texto
   const sepRegex = /\s+[-\/]\s+/g;
-  let ultimoMatch = null;
-  let m;
+  let ultimoMatch = null, m;
   while ((m = sepRegex.exec(limpo)) !== null) ultimoMatch = m;
-
   if (ultimoMatch) {
     const candidato = limpo.slice(ultimoMatch.index + ultimoMatch[0].length).trim();
-    if (candidato.length > 2) {
-      result.obsFinale = candidato;
-      limpo = limpo.slice(0, ultimoMatch.index).trim();
-    }
+    if (candidato.length > 2) { result.obsFinale = candidato; limpo = limpo.slice(0, ultimoMatch.index).trim(); }
   }
-
-  // Remove unidade do final do que sobrou
   let unidade = '';
   const um = limpo.match(/^(.*?)\s*[-\/]?\s*(Unidade\s+.*?(?:Bl\/?Qd\s*[\w\-]*)?)\s*$/i);
   if (um && um[2]) { unidade = um[2].trim(); limpo = um[1].trim(); }
   result.unidade = unidade;
   limpo = limpo.replace(/\s+[-\/]\s*$/,'').trim();
-
   const mProp = limpo.match(/^proposta\s*[:\-]?\s*(\d+)\s*$/i);
   if (mProp) { result.proposta = mProp[1]; result.confianca = 'alta'; return result; }
-
-  // Divide por " - " ou " / " para extrair os demais campos
   const blocos = limpo.split(/\s+[-\/]\s+/).map(b=>b.trim()).filter(Boolean);
   if (!blocos.length) return result;
-
   function extraiProposta(bloco) {
-    let m = bloco.match(/^(.*?)[\/]\s*(\d{5,})\s*$/);
-    if (m) return { nome:m[1].trim(), prop:m[2] };
-    m = bloco.match(/^(.*?)\s+(\d{5,})\s*$/);
-    if (m) return { nome:m[1].trim(), prop:m[2] };
-    m = bloco.match(/^(\d{5,})\s*$/);
-    if (m) return { nome:'', prop:m[1] };
-    m = bloco.match(/^proposta\s*[:\-]?\s*(\d+)\s*(.*)$/i);
-    if (m) return { nome:m[2]?m[2].trim():'', prop:m[1] };
+    let m = bloco.match(/^(.*?)[\/]\s*(\d{5,})\s*$/); if (m) return { nome:m[1].trim(), prop:m[2] };
+    m = bloco.match(/^(.*?)\s+(\d{5,})\s*$/); if (m) return { nome:m[1].trim(), prop:m[2] };
+    m = bloco.match(/^(\d{5,})\s*$/); if (m) return { nome:'', prop:m[1] };
+    m = bloco.match(/^proposta\s*[:\-]?\s*(\d+)\s*(.*)$/i); if (m) return { nome:m[2]?m[2].trim():'', prop:m[1] };
     return null;
   }
-
   const ep0 = extraiProposta(blocos[0]);
   if (ep0 && ep0.nome) { result.pagador=ep0.nome; result.proposta=ep0.prop; result.confianca='alta'; }
   else if (ep0 && !ep0.nome) { result.proposta=ep0.prop; result.confianca='media'; }
   else if (/^proposta$/i.test(blocos[0])) { result.confianca='baixa'; }
   else { result.pagador=blocos[0]; result.confianca='media'; }
-
   for (let i=1;i<blocos.length;i++) {
     const epi = extraiProposta(blocos[i]);
     if (epi) { if(epi.prop&&!result.proposta)result.proposta=epi.prop; if(epi.nome&&!result.empreendimento)result.empreendimento=epi.nome; continue; }
@@ -71,20 +49,66 @@ function parseCamposERP(raw) {
   return result;
 }
 
-// Observação final: o que vem após o último " - " no campo Contrato.
-// Fallback: coluna Descrição da planilha importada.
 function extrairObsERP(rawContrato, rawDescricao) {
   const parsed = parseCamposERP(rawContrato);
   if (parsed.obsFinale) return parsed.obsFinale;
   const desc = String(rawDescricao || '').trim();
-  if (desc) return desc;
-  return '';
+  return desc || '';
 }
+
+// ── Revisão CAR ──
+// Calcula o status de revisão com base na data do último ciclo (dia 10) e da última revisão
+// Em dia    → revisado nos últimos 7 dias
+// Atenção   → sem revisão há mais de 7 dias mas menos de 15
+// Crítico   → sem revisão há 15+ dias, OU nunca revisado após 5 dias úteis do fechamento
+function calcularStatusRevisao(p) {
+  if (p.status === 'Resolvida') return null;
+  const hoje = new Date(); hoje.setHours(0,0,0,0);
+
+  // Data da última revisão — usa data_ultima_revisao ou fallback ao histórico
+  let dtRevisao = null;
+  if (p.dataUltimaRevisao) {
+    const [d,mm,y] = p.dataUltimaRevisao.split('/');
+    if (d && mm && y) dtRevisao = new Date(Number(y), Number(mm)-1, Number(d));
+  }
+  if (!dtRevisao && p.historico && p.historico.length) {
+    // usa a data do último registro do histórico
+    const ult = String(p.historico[p.historico.length-1]).match(/^(\d{1,2})\/(\d{1,2})/);
+    if (ult) {
+      dtRevisao = new Date(hoje.getFullYear(), Number(ult[2])-1, Number(ult[1]));
+      if (dtRevisao > hoje) dtRevisao.setFullYear(hoje.getFullYear()-1);
+    }
+  }
+
+  if (!dtRevisao) {
+    // Nunca revisado — verifica se passou 5 dias do fechamento
+    if (p.dataFechamento) {
+      const [d,mm,y] = p.dataFechamento.split('/');
+      if (d && mm && y) {
+        const dtFech = new Date(Number(y), Number(mm)-1, Number(d));
+        const diasDesdeFech = Math.round((hoje - dtFech) / 86400000);
+        if (diasDesdeFech >= 5) return 'critico';
+      }
+    }
+    return 'critico'; // sem data de revisão nem fechamento → crítico
+  }
+
+  const diasSemRevisao = Math.round((hoje - dtRevisao) / 86400000);
+  if (diasSemRevisao <= 7) return 'em_dia';
+  if (diasSemRevisao <= 14) return 'atencao';
+  return 'critico';
+}
+
+const LABEL_REVISAO = { em_dia: 'Em dia', atencao: 'Atenção', critico: 'Crítico' };
+const COR_REVISAO   = { em_dia: '#0A7A48', atencao: '#9A7800', critico: '#B91C1C' };
+const BG_REVISAO    = { em_dia: '#E9F6EF', atencao: '#FFF8E1', critico: '#FDECEA' };
+const BORDA_REVISAO = { em_dia: '#A3DCC0', atencao: '#FFD54F', critico: '#F5A5A3' };
+const DOT_REVISAO   = { em_dia: '#12B76A', atencao: '#F59E0B', critico: '#E8334A' };
 
 const CAMPOS_DESTINO = [
   { key:'ccusto', label:'C.Custo / Loja' },
-  { key:'contrato', label:'Contrato (texto rico — será separado automaticamente)' },
-  { key:'descricao', label:'Descrição (obs — fallback se Contrato não tiver obs)' },
+  { key:'contrato', label:'Contrato (texto rico — separado automaticamente)' },
+  { key:'descricao', label:'Descrição (fallback da obs)' },
   { key:'pagador', label:'Pagador (já separado)' },
   { key:'empreendimento', label:'Empreendimento (já separado)' },
   { key:'proposta', label:'Proposta (já separado)' },
@@ -103,7 +127,6 @@ const HEURISTICS = {
   data:['data','date','receb','venc'],
   valor:['valor','value','total','vlr','vl'],
 };
-
 const COLUNAS_IGNORAR_EXATAS = ['mes','ano','mes/ano','cliente','tipo','status'];
 
 function guessField(col) {
@@ -124,7 +147,7 @@ function parseData(raw) {
   if (!raw) return '';
   const s = String(raw).trim();
   const mBR = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if (mBR) { const [,d,m,y]=mBR; return d.padStart(2,'0')+'/'+m.padStart(2,'0')+'/'+(y.length===2?'20'+y:y); }
+  if (mBR) { const [,d,mm,y]=mBR; return d.padStart(2,'0')+'/'+mm.padStart(2,'0')+'/'+(y.length===2?'20'+y:y); }
   const mISO = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (mISO) return mISO[3]+'/'+mISO[2]+'/'+mISO[1];
   const num = parseFloat(s);
@@ -133,6 +156,12 @@ function parseData(raw) {
     if (d) return String(d.d).padStart(2,'0')+'/'+String(d.m).padStart(2,'0')+'/'+d.y;
   }
   return s;
+}
+
+// Retorna o dia 10 do mês atual como data de fechamento do ciclo (DD/MM/YYYY)
+function dataFechamentoCicloAtual() {
+  const hoje = new Date();
+  return `10/${String(hoje.getMonth()+1).padStart(2,'0')}/${hoje.getFullYear()}`;
 }
 
 function fmt(v) { return 'R$ '+Number(v).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}); }
@@ -144,7 +173,6 @@ function nextId(existing) {
 }
 
 const SLA_PADRAO_DIAS = 1;
-
 function parseDataCurta(s) {
   if (!s) return null;
   const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})/);
@@ -153,52 +181,39 @@ function parseDataCurta(s) {
   const dt = new Date(anoAtual, parseInt(m[2],10)-1, parseInt(m[1],10));
   return isNaN(dt.getTime()) ? null : dt;
 }
-
 function dataUltimaMovimentacao(historico) {
-  if (!historico || !historico.length) return null;
-  return parseDataCurta(historico[historico.length - 1]);
+  if (!historico||!historico.length) return null;
+  return parseDataCurta(historico[historico.length-1]);
 }
-
 function dataCriacaoDoHistorico(historico) {
-  if (!historico || !historico.length) return null;
+  if (!historico||!historico.length) return null;
   return parseDataCurta(historico[0]);
 }
-
 function dataResolucaoDoHistorico(historico) {
-  if (!historico || !historico.length) return null;
-  for (let i = historico.length - 1; i >= 0; i--) {
-    if (/resolvid/i.test(String(historico[i]))) return parseDataCurta(historico[i]);
-  }
+  if (!historico||!historico.length) return null;
+  for (let i=historico.length-1;i>=0;i--) if (/resolvid/i.test(String(historico[i]))) return parseDataCurta(historico[i]);
   return null;
 }
-
 function diasDesdeUltimaMovimentacao(p) {
-  const dt = dataUltimaMovimentacao(p.historico) || dataCriacaoDoHistorico(p.historico);
+  const dt = dataUltimaMovimentacao(p.historico)||dataCriacaoDoHistorico(p.historico);
   if (!dt) return null;
-  const hoje = new Date(); hoje.setHours(0,0,0,0);
-  dt.setHours(0,0,0,0);
-  return Math.round((hoje - dt) / 86400000);
+  const hoje=new Date(); hoje.setHours(0,0,0,0); dt.setHours(0,0,0,0);
+  return Math.round((hoje-dt)/86400000);
 }
-
 function statusEfetivo(p) {
-  if (p.status === 'Resolvida') return 'Resolvida';
-  const dias = diasDesdeUltimaMovimentacao(p);
-  if (dias !== null && dias > SLA_PADRAO_DIAS) return 'Atrasada';
+  if (p.status==='Resolvida') return 'Resolvida';
+  const dias=diasDesdeUltimaMovimentacao(p);
+  if (dias!==null&&dias>SLA_PADRAO_DIAS) return 'Atrasada';
   return p.status;
 }
-
 function calcularSlaMedia(pendencias) {
-  const tempos = [];
-  pendencias.filter(p => p.status === 'Resolvida').forEach(p => {
-    const inicio = dataCriacaoDoHistorico(p.historico);
-    const fim = dataResolucaoDoHistorico(p.historico);
-    if (inicio && fim) {
-      const dias = Math.round((fim - inicio) / 86400000);
-      if (dias >= 0) tempos.push(dias);
-    }
+  const tempos=[];
+  pendencias.filter(p=>p.status==='Resolvida').forEach(p=>{
+    const inicio=dataCriacaoDoHistorico(p.historico), fim=dataResolucaoDoHistorico(p.historico);
+    if (inicio&&fim) { const dias=Math.round((fim-inicio)/86400000); if(dias>=0)tempos.push(dias); }
   });
   if (!tempos.length) return null;
-  return Math.round((tempos.reduce((a,b)=>a+b,0) / tempos.length) * 10) / 10;
+  return Math.round((tempos.reduce((a,b)=>a+b,0)/tempos.length)*10)/10;
 }
 
 export default function Home({ sessao }) {
@@ -214,6 +229,7 @@ export default function Home({ sessao }) {
   const [busca, setBusca] = useState('');
   const [fStatus, setFStatus] = useState('');
   const [fTipo, setFTipo] = useState('');
+  const [fRevisao, setFRevisao] = useState(''); // 'em_dia' | 'atencao' | 'critico' | ''
 
   const [selecionados, setSelecionados] = useState(new Set());
   const [deletandoLote, setDeletandoLote] = useState(false);
@@ -237,13 +253,12 @@ export default function Home({ sessao }) {
   const showToast = useCallback((msg) => {
     setToast(msg);
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(()=>setToast(''),3500);
+    toastTimer.current = setTimeout(()=>setToast(''),4000);
   },[]);
 
   useEffect(() => {
     if (!sessao) return;
-    supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single()
-      .then(({data}) => setPerfil(data));
+    supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single().then(({data})=>setPerfil(data));
   },[sessao]);
 
   const loadPendencias = useCallback(async () => {
@@ -258,6 +273,8 @@ export default function Home({ sessao }) {
       responsavel:row.responsavel||'', acao:row.acao||'', obs:row.obs||'',
       historico:Array.isArray(row.historico)?row.historico:[],
       origem:row.origem||'manual', confianca:row.confianca||null,
+      dataFechamento:row.data_fechamento||'',
+      dataUltimaRevisao:row.data_ultima_revisao||'',
     })));
     setSelecionados(new Set());
     setLoading(false);
@@ -265,10 +282,20 @@ export default function Home({ sessao }) {
 
   useEffect(()=>{ loadPendencias(); },[loadPendencias]);
 
+  // Filtragem com status de revisão
   const filtered = pendencias.filter(p=>{
     const b=busca.toLowerCase();
     const bOk=!b||[p.pagador,p.empreendimento,p.proposta,p.loja,p.id].some(x=>(x||'').toLowerCase().includes(b));
-    return bOk&&(!fStatus||statusEfetivo(p)===fStatus)&&(!fTipo||p.tipo===fTipo);
+    const revisao = calcularStatusRevisao(p);
+    const revOk = !fRevisao || revisao===fRevisao;
+    return bOk&&(!fStatus||statusEfetivo(p)===fStatus)&&(!fTipo||p.tipo===fTipo)&&revOk;
+  });
+
+  // Contadores de revisão
+  const contagemRevisao = { em_dia:0, atencao:0, critico:0 };
+  pendencias.filter(p=>p.status!=='Resolvida').forEach(p=>{
+    const r = calcularStatusRevisao(p);
+    if (r) contagemRevisao[r]++;
   });
 
   const metrics = {
@@ -278,13 +305,11 @@ export default function Home({ sessao }) {
     atr:pendencias.filter(p=>statusEfetivo(p)==='Atrasada').length,
     res:pendencias.filter(p=>p.status==='Resolvida').length,
     val:pendencias.reduce((a,p)=>a+Number(p.valor),0),
-    slaMedia: calcularSlaMedia(pendencias),
+    slaMedia:calcularSlaMedia(pendencias),
   };
 
   const todosVisivelsSelecionados = filtered.length>0&&filtered.every(p=>selecionados.has(p.id));
-  function toggleSelecionado(id) {
-    setSelecionados(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; });
-  }
+  function toggleSelecionado(id) { setSelecionados(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; }); }
   function toggleTodos() {
     if (todosVisivelsSelecionados) setSelecionados(prev=>{ const n=new Set(prev); filtered.forEach(p=>n.delete(p.id)); return n; });
     else setSelecionados(prev=>{ const n=new Set(prev); filtered.forEach(p=>n.add(p.id)); return n; });
@@ -295,14 +320,13 @@ export default function Home({ sessao }) {
     setDeletandoLote(true);
     const {error}=await supabase.from('pendencias').delete().in('id',ids);
     setDeletandoLote(false);
-    if (error){showToast('Erro: '+error.message);return;}
-    await loadPendencias();
-    showToast(`${ids.length} pendência(s) excluída(s).`);
+    if(error){showToast('Erro: '+error.message);return;}
+    await loadPendencias(); showToast(`${ids.length} pendência(s) excluída(s).`);
   }
   async function deletar(id) {
     if (!confirm('Excluir a pendência '+id+'?')) return;
     const {error}=await supabase.from('pendencias').delete().eq('id',id);
-    if (error){showToast('Erro: '+error.message);return;}
+    if(error){showToast('Erro: '+error.message);return;}
     await loadPendencias(); showToast('Pendência removida.');
   }
 
@@ -341,18 +365,18 @@ export default function Home({ sessao }) {
     }
     if(campo||campos.length){campos.push(campo);if(campos.some(f=>f.trim()))linhas.push(campos);}
     if(linhas.length<2){alert('Arquivo vazio.');return;}
-    finalizarImport(linhas[0].map(String), linhas.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')), linhas.slice(1,6));
+    finalizarImport(linhas[0].map(String),linhas.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')),linhas.slice(1,6));
   }
 
   function processWorkbook(wb) {
     const ws=wb.Sheets[wb.SheetNames[0]];
     const json=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',raw:true});
     if(!json||json.length<2){alert('Arquivo vazio.');return;}
-    finalizarImport(json[0].map(String), json.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')), json.slice(1,6));
+    finalizarImport(json[0].map(String),json.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')),json.slice(1,6));
   }
 
-  function finalizarImport(cols, rows, preview) {
-    setDetectedCols(cols); setImportedRows(rows); setPreviewRows(preview);
+  function finalizarImport(cols,rows,preview) {
+    setDetectedCols(cols);setImportedRows(rows);setPreviewRows(preview);
     const m={}; cols.forEach((col,i)=>{m[i]=guessField(col);}); setMapping(m);
   }
 
@@ -366,44 +390,58 @@ export default function Home({ sessao }) {
     const map=getMappingByField(); setSaving(true);
     const dateStr=new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
     const nomeResponsavel=perfil?.nome||sessao?.user?.email||'Sistema';
-    const novas=[]; let seed=[...pendencias];
+    const dataFechamento=dataFechamentoCicloAtual();
+
+    // ── Detecção de duplicatas ──
+    // Chave de duplicata: loja + valor + dataReceb (identifica o mesmo lançamento)
+    const chavesDuplicata = new Set(
+      pendencias.map(p=>`${(p.loja||'').trim().toLowerCase()}|${p.valor}|${p.dataReceb}`)
+    );
+
+    const novas=[]; const duplicatas=[]; let seed=[...pendencias];
 
     importedRows.forEach(row=>{
-      const cRaw = map.contrato!==undefined ? String(row[map.contrato]||'') : '';
-      const descRaw = map.descricao!==undefined ? String(row[map.descricao]||'') : '';
+      const cRaw = map.contrato!==undefined?String(row[map.contrato]||''):'';
+      const descRaw = map.descricao!==undefined?String(row[map.descricao]||''):'';
       const parsed = parseCamposERP(cRaw);
+      const obsLida = extrairObsERP(cRaw,descRaw);
+      const obs = [obsLida, cRaw?'ERP: '+cRaw:''].filter(Boolean).join(' · ');
 
-      // ── Nova lógica de obs:
-      // 1. O que vem após o último " - " no campo Contrato
-      // 2. Fallback: coluna Descrição
-      // 3. Texto original completo preservado sempre
-      const obsLida = extrairObsERP(cRaw, descRaw);
-      const partes = [];
-      if (obsLida) partes.push(obsLida);
-      if (cRaw) partes.push('ERP: ' + cRaw);
-      const obs = partes.join(' · ');
+      const loja = map.ccusto!==undefined?String(row[map.ccusto]||''):'';
+      const valor = map.valor!==undefined?parseValor(row[map.valor]):0;
+      const dataReceb = map.data!==undefined?parseData(row[map.data]):'';
+
+      // Verifica duplicata
+      const chave = `${loja.trim().toLowerCase()}|${valor}|${dataReceb}`;
+      if (chavesDuplicata.has(chave)) { duplicatas.push(chave); return; }
+      chavesDuplicata.add(chave); // evita duplicata dentro do próprio lote
 
       const newId=nextId(seed);
       const nova={
-        id:newId,
-        loja:map.ccusto!==undefined?String(row[map.ccusto]||''):'',
-        pagador:map.pagador!==undefined?String(row[map.pagador]||''):parsed.pagador,
+        id:newId, loja, pagador:map.pagador!==undefined?String(row[map.pagador]||''):parsed.pagador,
         empreendimento:map.empreendimento!==undefined?String(row[map.empreendimento]||''):parsed.empreendimento,
         proposta:map.proposta!==undefined?String(row[map.proposta]||''):parsed.proposta,
-        dataReceb:map.data!==undefined?parseData(row[map.data]):'',
-        valor:map.valor!==undefined?parseValor(row[map.valor]):0,
-        tipo:'Documentação', status:'Pendente', responsavel:'', acao:'A definir', obs,
+        dataReceb, valor, tipo:'Documentação', status:'Pendente',
+        responsavel:'', acao:'A definir', obs,
         historico:[`${dateStr} - Importado do ERP por ${nomeResponsavel} (confiança: ${parsed.confianca})`],
         origem:'erp', confianca:parsed.confianca,
+        dataFechamento, dataUltimaRevisao:'',
       };
       novas.push(nova); seed=[...seed,nova];
     });
+
+    if (!novas.length) {
+      setSaving(false);
+      showToast(`Nenhuma pendência nova — ${duplicatas.length} duplicata(s) ignorada(s).`);
+      return;
+    }
 
     const {error}=await supabase.from('pendencias').insert(novas.map(p=>({
       id:p.id,loja:p.loja,pagador:p.pagador,empreendimento:p.empreendimento,
       proposta:p.proposta,data_receb:p.dataReceb,valor:p.valor,tipo:p.tipo,
       status:p.status,responsavel:p.responsavel,acao:p.acao,obs:p.obs,
       historico:p.historico,origem:p.origem,confianca:p.confianca,
+      data_fechamento:p.dataFechamento, data_ultima_revisao:p.dataUltimaRevisao,
     })));
     setSaving(false);
     if(error){showToast('Erro ao importar: '+error.message);return;}
@@ -411,13 +449,14 @@ export default function Home({ sessao }) {
     setImportOpen(false);setDetectedCols([]);setImportedRows([]);setPreviewRows([]);setFileName('');
     if(fileInputRef.current)fileInputRef.current.value='';
     const rev=novas.filter(p=>p.confianca==='media'||p.confianca==='baixa').length;
-    showToast(novas.length+' importada(s)! '+(rev?rev+' precisam revisão.':''));
+    const msgDup = duplicatas.length ? ` · ${duplicatas.length} duplicata(s) ignorada(s)` : '';
+    showToast(`${novas.length} importada(s)!${msgDup}${rev?' · '+rev+' precisam revisão':''}`);
   }
 
   function openModal(id) {
     setEditingId(id);
     if(id){const p=pendencias.find(x=>x.id===id);setForm({...p});}
-    else setForm({loja:'',status:'Pendente',pagador:'',empreendimento:'',proposta:'',dataReceb:'',valor:'',tipo:'Documentação',responsavel:perfil?.nome||'',acao:'',obs:'',historico:[]});
+    else setForm({loja:'',status:'Pendente',pagador:'',empreendimento:'',proposta:'',dataReceb:'',valor:'',tipo:'Documentação',responsavel:perfil?.nome||'',acao:'',obs:'',historico:[],dataFechamento:'',dataUltimaRevisao:''});
     setHistNew('');setModalOpen(true);
   }
   function closeModal(){setModalOpen(false);setEditingId(null);}
@@ -427,20 +466,21 @@ export default function Home({ sessao }) {
     const nomeResponsavel=perfil?.nome||sessao?.user?.email||'Sistema';
     const resp=(form.responsavel||'').trim()||nomeResponsavel;
     const dateStr=new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
+    const hoje=new Date().toLocaleDateString('pt-BR');
+
     if(editingId){
       const existing=pendencias.find(p=>p.id===editingId);
       const novoHist=[...(existing.historico||[])];
-      const mudouParaResolvida = existing.status!=='Resolvida' && form.status==='Resolvida';
-      if (mudouParaResolvida) {
-        novoHist.push(`${dateStr} - Marcado como Resolvida por ${nomeResponsavel}${histNew?' — '+histNew:''}`);
-      } else {
-        novoHist.push(histNew?`${dateStr} - ${histNew} (${nomeResponsavel})`:`${dateStr} - Atualizado por ${nomeResponsavel}`);
-      }
+      const mudouParaResolvida=existing.status!=='Resolvida'&&form.status==='Resolvida';
+      if(mudouParaResolvida) novoHist.push(`${dateStr} - Marcado como Resolvida por ${nomeResponsavel}${histNew?' — '+histNew:''}`);
+      else novoHist.push(histNew?`${dateStr} - ${histNew} (${nomeResponsavel})`:`${dateStr} - Atualizado por ${nomeResponsavel}`);
+
       const {error}=await supabase.from('pendencias').update({
         loja:form.loja||'',pagador:form.pagador||'',empreendimento:form.empreendimento||'',
         proposta:form.proposta||'',data_receb:form.dataReceb||'',valor:parseFloat(form.valor)||0,
         tipo:form.tipo||'Documentação',status:form.status||'Pendente',responsavel:resp,
         acao:form.acao||'',obs:form.obs||'',historico:novoHist,
+        data_ultima_revisao:hoje, // atualiza data de revisão a cada edição
       }).eq('id',editingId);
       setSaving(false);
       if(error){showToast('Erro: '+error.message);return;}
@@ -452,6 +492,7 @@ export default function Home({ sessao }) {
         tipo:form.tipo||'Documentação',status:form.status||'Pendente',responsavel:resp,
         acao:form.acao||'',obs:form.obs||'',
         historico:[`${dateStr} - Criado por ${nomeResponsavel}`],origem:'manual',
+        data_fechamento:dataFechamentoCicloAtual(),data_ultima_revisao:hoje,
       });
       setSaving(false);
       if(error){showToast('Erro: '+error.message);return;}
@@ -461,9 +502,17 @@ export default function Home({ sessao }) {
 
   function exportExcel(){
     if(!pendencias.length){alert('Nenhuma pendência para exportar.');return;}
-    const rows=pendencias.map(p=>({ID:p.id,Origem:p.origem==='erp'?'ERP':'Manual','C.Custo / Loja':p.loja,Pagador:p.pagador,Empreendimento:p.empreendimento,'Proposta / Contrato':p.proposta,'Data Receb.':p.dataReceb,'Valor (R$)':p.valor,Tipo:p.tipo,Status:p.status,Responsável:p.responsavel,'Próxima Ação':p.acao,Observações:p.obs,Histórico:(p.historico||[]).join(' | ')}));
+    const rows=pendencias.map(p=>({
+      ID:p.id,Origem:p.origem==='erp'?'ERP':'Manual','C.Custo / Loja':p.loja,
+      Pagador:p.pagador,Empreendimento:p.empreendimento,'Proposta':p.proposta,
+      'Data Receb.':p.dataReceb,'Valor (R$)':p.valor,Status:p.status,
+      Responsável:p.responsavel,'Próxima Ação':p.acao,Observações:p.obs,
+      'Data Fechamento':p.dataFechamento,'Última Revisão':p.dataUltimaRevisao,
+      'Status Revisão':LABEL_REVISAO[calcularStatusRevisao(p)]||'',
+      Histórico:(p.historico||[]).join(' | '),
+    }));
     const ws=XLSX.utils.json_to_sheet(rows);
-    ws['!cols']=[{wch:10},{wch:8},{wch:30},{wch:26},{wch:24},{wch:16},{wch:12},{wch:14},{wch:14},{wch:14},{wch:20},{wch:32},{wch:42},{wch:60}];
+    ws['!cols']=[{wch:10},{wch:8},{wch:30},{wch:26},{wch:24},{wch:16},{wch:12},{wch:14},{wch:14},{wch:20},{wch:32},{wch:42},{wch:14},{wch:14},{wch:14},{wch:60}];
     const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Pendências');
     XLSX.writeFile(wb,'Central_Pendencias_MyBroker_'+new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')+'.xlsx');
   }
@@ -525,7 +574,7 @@ export default function Home({ sessao }) {
             <div className="import-card">
               <div className="import-card-num">02</div>
               <div className="import-card-label">Mapeamento de colunas</div>
-              {detectedCols.length===0 ? <div className="map-empty">Carregue um arquivo para configurar</div> : (
+              {detectedCols.length===0?<div className="map-empty">Carregue um arquivo para configurar</div>:(
                 detectedCols.map((col,i)=>(
                   <div className="map-row" key={i}>
                     <div className="map-lbl" title={col}>{col}</div>
@@ -538,7 +587,7 @@ export default function Home({ sessao }) {
               )}
             </div>
           </div>
-          {previewRows.length>0 && (
+          {previewRows.length>0&&(
             <div className="preview-wrap" style={{display:'block'}}>
               <div className="preview-eyebrow">Pré-visualização — primeiras 5 linhas</div>
               <div className="preview-scroll">
@@ -553,7 +602,7 @@ export default function Home({ sessao }) {
             <div className="import-info">{importedRows.length>0?`${importedRows.length} linha(s) · ${detectedCols.length} coluna(s)`:''}</div>
             <div style={{display:'flex',gap:6}}>
               <button className="chip" onClick={()=>setImportOpen(false)}>Cancelar</button>
-              {importedRows.length>0 && <button className="chip chip-yellow" onClick={doImport} disabled={saving}>{saving?'Importando...':'✓ Importar pendências'}</button>}
+              {importedRows.length>0&&<button className="chip chip-yellow" onClick={doImport} disabled={saving}>{saving?'Importando...':'✓ Importar pendências'}</button>}
             </div>
           </div>
         </div>
@@ -579,7 +628,7 @@ export default function Home({ sessao }) {
             <div className="metric-num">✓</div><div className="metric-lbl">Resolvidas</div><div className="metric-val green">{metrics.res}</div>
           </div>
           <div className="metric sla">
-            <div className="metric-num">⏱</div><div className="metric-lbl">SLA Médio</div><div className="metric-val sm">{metrics.slaMedia !== null ? metrics.slaMedia + ' dias' : '—'}</div>
+            <div className="metric-num">⏱</div><div className="metric-lbl">SLA Médio</div><div className="metric-val sm">{metrics.slaMedia!==null?metrics.slaMedia+' dias':'—'}</div>
           </div>
           <div className="metric val">
             <div className="metric-num">R$</div><div className="metric-lbl">Valor Total</div><div className="metric-val sm">{fmt(metrics.val)}</div>
@@ -588,6 +637,34 @@ export default function Home({ sessao }) {
       </div>
       <div className="sla-hint">SLA padrão: {SLA_PADRAO_DIAS} dia útil · Atrasada = sem movimentação dentro do prazo · SLA Médio = tempo real até resolução</div>
 
+      {/* FAIXA DE REVISÃO CAR — clicável como filtro */}
+      <div className="revisao-strip">
+        <div className="revisao-eyebrow">Revisão do ciclo CAR · clique para filtrar</div>
+        <div className="revisao-cards">
+          {['em_dia','atencao','critico'].map(k=>(
+            <div
+              key={k}
+              className={'revisao-card'+(fRevisao===k?' rev-active':'')}
+              style={{background:BG_REVISAO[k],borderColor:BORDA_REVISAO[k]}}
+              onClick={()=>setFRevisao(fRevisao===k?'':k)}
+            >
+              <div className="rev-left">
+                <div className="rev-dot" style={{background:DOT_REVISAO[k]}}/>
+                <div>
+                  <div className="rev-label" style={{color:COR_REVISAO[k]}}>{LABEL_REVISAO[k]}</div>
+                  <div className="rev-sub">
+                    {k==='em_dia'&&'Revisado nos últimos 7 dias'}
+                    {k==='atencao'&&'Sem revisão há 8–14 dias'}
+                    {k==='critico'&&'Sem revisão há 15+ dias ou nunca revisado'}
+                  </div>
+                </div>
+              </div>
+              <div className="rev-num" style={{color:COR_REVISAO[k]}}>{contagemRevisao[k]}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
       {/* TOOLBAR */}
       <div className="toolbar">
         <input className="fld" type="text" placeholder="Buscar pagador, empreendimento, proposta, ID..." value={busca} onChange={e=>setBusca(e.target.value)} />
@@ -595,15 +672,17 @@ export default function Home({ sessao }) {
           <option value="">Todos os status</option>
           <option>Pendente</option><option>Em andamento</option><option>Atrasada</option><option>Resolvida</option>
         </select>
-        <select className="fld" value={fTipo} onChange={e=>setFTipo(e.target.value)}>
-          <option value="">Todos os tipos</option>
-          <option>Documentação</option><option>Pagamento</option><option>Assinatura</option><option>Vistoria</option><option>Outro</option>
+        <select className="fld" value={fRevisao} onChange={e=>setFRevisao(e.target.value)}>
+          <option value="">Todas as revisões</option>
+          <option value="em_dia">Em dia</option>
+          <option value="atencao">Atenção</option>
+          <option value="critico">Crítico</option>
         </select>
-        {loading && <span style={{color:'rgba(255,255,255,.5)',fontSize:11,fontFamily:"'DM Mono',monospace"}}>carregando…</span>}
+        {loading&&<span style={{color:'rgba(255,255,255,.5)',fontSize:11,fontFamily:"'DM Mono',monospace"}}>carregando…</span>}
       </div>
 
       {/* BULK ACTION BAR */}
-      {isAdmin && selecionados.size>0 && (
+      {isAdmin&&selecionados.size>0&&(
         <div className="bulk-bar">
           <div className="bulk-info">
             <div className="bulk-count">{selecionados.size}</div>
@@ -624,34 +703,37 @@ export default function Home({ sessao }) {
           <table>
             <thead>
               <tr>
-                {isAdmin && <th style={{width:40,textAlign:'center'}}><input type="checkbox" className="cb" checked={todosVisivelsSelecionados} onChange={toggleTodos}/></th>}
+                {isAdmin&&<th style={{width:40,textAlign:'center'}}><input type="checkbox" className="cb" checked={todosVisivelsSelecionados} onChange={toggleTodos}/></th>}
                 <th>ID</th><th>C.Custo / Loja</th><th>Pagador</th><th>Empreendimento</th>
                 <th>Proposta</th><th>Data Receb.</th><th>Valor</th>
                 <th>Observação</th><th></th>
               </tr>
             </thead>
             <tbody>
-              {filtered.length===0 ? (
+              {filtered.length===0?(
                 <tr className="empty-row">
                   <td colSpan={isAdmin?10:9}>
                     {loading?'Carregando...':pendencias.length===0?'Nenhuma pendência cadastrada':'Nenhum resultado para os filtros'}
                   </td>
                 </tr>
-              ) : filtered.map(p=>{
-                const statusReal = statusEfetivo(p);
-                const b=badge(statusReal);
+              ):filtered.map(p=>{
+                const statusReal=statusEfetivo(p);
                 const sel=selecionados.has(p.id);
-                const diasParado = p.status!=='Resolvida' ? diasDesdeUltimaMovimentacao(p) : null;
-                const estourouSla = diasParado !== null && diasParado > SLA_PADRAO_DIAS;
-                // Extrai a observação legível do campo obs (o que vem antes do " · ERP:")
-                const obsLegivel = p.obs ? p.obs.split(' · ERP:')[0].trim() : '';
+                const diasParado=p.status!=='Resolvida'?diasDesdeUltimaMovimentacao(p):null;
+                const estourouSla=diasParado!==null&&diasParado>SLA_PADRAO_DIAS;
+                const obsLegivel=p.obs?p.obs.split(' · ERP:')[0].trim():'';
+                const revisao=calcularStatusRevisao(p);
                 return (
                   <tr key={p.id} className={(sel?'row-selected ':'')+(estourouSla?'row-atrasada':'')} onClick={isAdmin?()=>toggleSelecionado(p.id):undefined} style={isAdmin?{cursor:'pointer'}:{}}>
-                    {isAdmin && <td style={{textAlign:'center'}} onClick={e=>e.stopPropagation()}><input type="checkbox" className="cb" checked={sel} onChange={()=>toggleSelecionado(p.id)}/></td>}
+                    {isAdmin&&<td style={{textAlign:'center'}} onClick={e=>e.stopPropagation()}><input type="checkbox" className="cb" checked={sel} onChange={()=>toggleSelecionado(p.id)}/></td>}
                     <td className="id-cell" onClick={e=>e.stopPropagation()}>
-                      {p.id}
-                      {p.origem==='erp'&&<span className="tag-erp">ERP</span>}
-                      {p.confianca&&p.confianca!=='alta'&&<span className={'tag-conf '+p.confianca}>{p.confianca}</span>}
+                      <div>{p.id}{p.origem==='erp'&&<span className="tag-erp">ERP</span>}{p.confianca&&p.confianca!=='alta'&&<span className={'tag-conf '+p.confianca}>{p.confianca}</span>}</div>
+                      {revisao&&(
+                        <div className="rev-badge-mini" style={{background:BG_REVISAO[revisao],color:COR_REVISAO[revisao],borderColor:BORDA_REVISAO[revisao]}}>
+                          <div className="rev-dot-mini" style={{background:DOT_REVISAO[revisao]}}/>
+                          {LABEL_REVISAO[revisao]}
+                        </div>
+                      )}
                     </td>
                     <td><div className="ellipsis" title={p.loja} style={{maxWidth:110,fontSize:10,color:'var(--muted)'}}>{p.loja||'—'}</div></td>
                     <td><div className="pagador-cell ellipsis" title={p.pagador}>{p.pagador||'—'}</div></td>
@@ -659,14 +741,10 @@ export default function Home({ sessao }) {
                     <td className="prop-cell">{p.proposta||'—'}</td>
                     <td className="date-cell">{p.dataReceb||'—'}</td>
                     <td className="val-cell">{fmt(p.valor)}</td>
-                    <td>
-                      <div className="ellipsis obs-cell" title={obsLegivel} style={{maxWidth:200}}>
-                        {obsLegivel || <span style={{color:'var(--muted)',fontStyle:'italic'}}>—</span>}
-                      </div>
-                    </td>
+                    <td><div className="ellipsis obs-cell" title={obsLegivel} style={{maxWidth:200}}>{obsLegivel||<span style={{color:'var(--muted)',fontStyle:'italic'}}>—</span>}</div></td>
                     <td style={{whiteSpace:'nowrap',display:'flex',gap:3,paddingTop:8}} onClick={e=>e.stopPropagation()}>
                       <button className="row-btn" onClick={()=>openModal(p.id)}>editar</button>
-                      {isAdmin && <button className="row-btn del" onClick={()=>deletar(p.id)}>excluir</button>}
+                      {isAdmin&&<button className="row-btn del" onClick={()=>deletar(p.id)}>excluir</button>}
                     </td>
                   </tr>
                 );
@@ -698,23 +776,40 @@ export default function Home({ sessao }) {
               <div className="fg"><label>Responsável</label><input type="text" value={form.responsavel||''} onChange={e=>setForm(f=>({...f,responsavel:e.target.value}))}/></div>
               <div className="fg full"><label>Próxima Ação</label><input type="text" value={form.acao||''} onChange={e=>setForm(f=>({...f,acao:e.target.value}))}/></div>
               <div className="fg full"><label>Observações</label><textarea value={form.obs||''} onChange={e=>setForm(f=>({...f,obs:e.target.value}))}/></div>
-              {editingId && (() => {
-                const pAtual = pendencias.find(x=>x.id===editingId);
-                const diasParado = pAtual && pAtual.status!=='Resolvida' ? diasDesdeUltimaMovimentacao(pAtual) : null;
-                const estourou = diasParado !== null && diasParado > SLA_PADRAO_DIAS;
+              {editingId&&(()=>{
+                const pAtual=pendencias.find(x=>x.id===editingId);
+                const diasParado=pAtual&&pAtual.status!=='Resolvida'?diasDesdeUltimaMovimentacao(pAtual):null;
+                const estourou=diasParado!==null&&diasParado>SLA_PADRAO_DIAS;
+                const revisao=pAtual?calcularStatusRevisao(pAtual):null;
                 return (
                   <>
-                    {diasParado !== null && (
+                    {/* Box SLA */}
+                    {diasParado!==null&&(
                       <div className="fg full">
                         <div className={'sla-modal-box'+(estourou?' sla-estourado':'')}>
                           <div className="sla-modal-label">SLA de resposta</div>
                           <div className="sla-modal-valor">
-                            {diasParado === 0 && 'Movimentado hoje — dentro do prazo'}
-                            {diasParado === 1 && !estourou && '1 dia sem nova movimentação — dentro do prazo'}
-                            {diasParado > 1 && !estourou && `${diasParado} dias sem movimentação — dentro do prazo`}
-                            {estourou && `⚠ ${diasParado} dia${diasParado>1?'s':''} sem retorno — SLA estourado`}
+                            {diasParado===0&&'Movimentado hoje — dentro do prazo'}
+                            {diasParado===1&&!estourou&&'1 dia sem movimentação — dentro do prazo'}
+                            {diasParado>1&&!estourou&&`${diasParado} dias sem movimentação — dentro do prazo`}
+                            {estourou&&`⚠ ${diasParado} dia${diasParado>1?'s':''} sem retorno — SLA estourado`}
                           </div>
-                          <div className="sla-modal-hint">Prazo: {SLA_PADRAO_DIAS} dia útil · Adicione uma tratativa para reiniciar o contador</div>
+                          <div className="sla-modal-hint">Prazo: {SLA_PADRAO_DIAS} dia útil · Salvar esta pendência reinicia o contador de revisão</div>
+                        </div>
+                      </div>
+                    )}
+                    {/* Box Revisão CAR */}
+                    {revisao&&(
+                      <div className="fg full">
+                        <div className="rev-modal-box" style={{background:BG_REVISAO[revisao],borderColor:BORDA_REVISAO[revisao]}}>
+                          <div className="rev-modal-label">Status de revisão do ciclo CAR</div>
+                          <div className="rev-modal-valor" style={{color:COR_REVISAO[revisao]}}>
+                            <div className="rev-dot" style={{background:DOT_REVISAO[revisao],display:'inline-block',marginRight:6}}/>
+                            {LABEL_REVISAO[revisao]}
+                            {pAtual?.dataUltimaRevisao&&` · última revisão: ${pAtual.dataUltimaRevisao}`}
+                            {!pAtual?.dataUltimaRevisao&&' · nunca revisado'}
+                          </div>
+                          <div className="rev-modal-hint">Ciclo: {pAtual?.dataFechamento||'—'} · Salvar atualiza a data de revisão para hoje</div>
                         </div>
                       </div>
                     )}
@@ -742,10 +837,10 @@ export default function Home({ sessao }) {
       <div className="footer-bar">
         <div className="footer-info">My Broker Imóveis · CSC Financeiro · Central de Pendências</div>
         <div className="footer-actions">
-          {isAdmin && <button className="footer-btn" onClick={()=>setImportOpen(v=>!v)}>↓ importar erp</button>}
+          {isAdmin&&<button className="footer-btn" onClick={()=>setImportOpen(v=>!v)}>↓ importar erp</button>}
           <button className="footer-btn" onClick={()=>router.push('/dashboard')}>📊 dashboard</button>
           <button className="footer-btn" onClick={exportExcel}>↑ exportar xlsx</button>
-          {isAdmin && <button className="footer-btn" onClick={()=>openModal(null)}>+ nova pendência</button>}
+          {isAdmin&&<button className="footer-btn" onClick={()=>openModal(null)}>+ nova pendência</button>}
           <button className="footer-btn" onClick={handleLogout}>⏻ sair</button>
         </div>
       </div>
@@ -771,7 +866,7 @@ export default function Home({ sessao }) {
         .chip-danger:disabled{opacity:.6;cursor:not-allowed;}
         .obs-cell{font-size:11px;color:var(--text2);}
         .metric.sla{border-color:#8A96B0;}
-        .sla-hint{background:var(--navy);padding:0 24px 14px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;color:rgba(255,255,255,.3);}
+        .sla-hint{background:var(--navy);padding:0 24px 10px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;color:rgba(255,255,255,.3);}
         tr.row-atrasada td{background:rgba(232,51,74,.04);}
         tr.row-atrasada:hover td{background:rgba(232,51,74,.08)!important;}
         tr.row-atrasada .id-cell{border-left:3px solid var(--danger);padding-left:8px;}
@@ -785,6 +880,29 @@ export default function Home({ sessao }) {
         .metric.clickable:hover{background:rgba(255,255,255,.09);}
         .metric.clickable:active{transform:scale(.97);}
         .metric.active{outline:2px solid var(--yellow);outline-offset:-2px;}
+
+        /* ── Revisão CAR ── */
+        .revisao-strip{background:var(--navy);padding:0 24px 14px;}
+        .revisao-eyebrow{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.35);margin-bottom:8px;padding-top:2px;}
+        .revisao-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+        .revisao-card{border:1px solid;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;transition:box-shadow .15s,opacity .15s;}
+        .revisao-card:hover{opacity:.88;}
+        .revisao-card.rev-active{box-shadow:0 0 0 2px #fff;}
+        .rev-left{display:flex;align-items:center;gap:8px;}
+        .rev-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+        .rev-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;}
+        .rev-sub{font-size:9px;color:#6B7280;margin-top:1px;}
+        .rev-num{font-size:22px;font-weight:700;}
+
+        /* Badge mini na linha da tabela */
+        .rev-badge-mini{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border:1px solid;border-radius:8px;font-size:8px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;margin-top:3px;}
+        .rev-dot-mini{width:5px;height:5px;border-radius:50%;flex-shrink:0;}
+
+        /* Box revisão no modal */
+        .rev-modal-box{padding:10px 14px;border:1px solid;border-radius:4px;margin-top:2px;}
+        .rev-modal-label{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
+        .rev-modal-valor{font-size:12px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;}
+        .rev-modal-hint{font-size:11px;color:var(--muted);}
       `}</style>
     </>
   );
