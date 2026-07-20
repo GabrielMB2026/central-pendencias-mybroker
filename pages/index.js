@@ -742,9 +742,11 @@ export default function Home({ sessao }) {
                     <td className="date-cell">{p.dataReceb||'—'}</td>
                     <td className="val-cell">{fmt(p.valor)}</td>
                     <td><div className="ellipsis obs-cell" title={obsLegivel} style={{maxWidth:200}}>{obsLegivel||<span style={{color:'var(--muted)',fontStyle:'italic'}}>—</span>}</div></td>
-                    <td style={{whiteSpace:'nowrap',display:'flex',gap:3,paddingTop:8}} onClick={e=>e.stopPropagation()}>
+                    <td style={{whiteSpace:'nowrap',verticalAlign:'middle'}} onClick={e=>e.stopPropagation()}>
+                      <div style={{display:'flex',gap:3}}>
                       <button className="row-btn" onClick={()=>openModal(p.id)}>editar</button>
                       {isAdmin&&<button className="row-btn del" onClick={()=>deletar(p.id)}>excluir</button>}
+                    </div>
                     </td>
                   </tr>
                 );
