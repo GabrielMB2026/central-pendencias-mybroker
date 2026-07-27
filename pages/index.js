@@ -220,6 +220,7 @@ export default function Home({ sessao }) {
   const router = useRouter();
   const [perfil, setPerfil] = useState(null);
   const isAdmin = perfil?.role === 'admin';
+  const [lojasDoUsuario, setLojasDoUsuario] = useState(null); // null = carregando, [] = sem restrição (admin), [...] = filtro ativo
 
   const [pendencias, setPendencias] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -258,7 +259,17 @@ export default function Home({ sessao }) {
 
   useEffect(() => {
     if (!sessao) return;
-    supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single().then(({data})=>setPerfil(data));
+    supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single().then(({data})=>{
+      setPerfil(data);
+      // Carrega lojas vinculadas ao usuário
+      if (data?.role === 'admin') {
+        setLojasDoUsuario([]); // admin vê tudo
+      } else {
+        supabase.from('user_lojas').select('loja').eq('user_id', sessao.user.id).then(({data: l}) => {
+          setLojasDoUsuario((l||[]).map(x => x.loja));
+        });
+      }
+    });
   },[sessao]);
 
   const loadPendencias = useCallback(async () => {
@@ -283,8 +294,15 @@ export default function Home({ sessao }) {
   useEffect(()=>{ loadPendencias(); },[loadPendencias]);
 
   // Filtragem com status de revisão
-  const filtered = pendencias.filter(p=>{
-    const b=busca.toLowerCase();
+  // Filtra pendências pelas lojas do usuário (editor vê só as suas, admin vê tudo)
+  const pendenciasFiltradas = !isAdmin && lojasDoUsuario && lojasDoUsuario.length > 0
+    ? pendencias.filter(p => {
+        const lojaUpper = (p.loja || '').toUpperCase().trim();
+        return lojasDoUsuario.some(l => lojaUpper.includes(l) || l.includes(lojaUpper));
+      })
+    : pendencias;
+
+  const filtered = pendenciasFiltradas.filter(p=>{    const b=busca.toLowerCase();
     const bOk=!b||[p.pagador,p.empreendimento,p.proposta,p.loja,p.id].some(x=>(x||'').toLowerCase().includes(b));
     const revisao = calcularStatusRevisao(p);
     const revOk = !fRevisao || revisao===fRevisao;
@@ -293,19 +311,19 @@ export default function Home({ sessao }) {
 
   // Contadores de revisão
   const contagemRevisao = { em_dia:0, atencao:0, critico:0 };
-  pendencias.filter(p=>p.status!=='Resolvida').forEach(p=>{
+  pendenciasFiltradas.filter(p=>p.status!=='Resolvida').forEach(p=>{
     const r = calcularStatusRevisao(p);
     if (r) contagemRevisao[r]++;
   });
 
   const metrics = {
-    total:pendencias.length,
-    pend:pendencias.filter(p=>statusEfetivo(p)==='Pendente').length,
-    and:pendencias.filter(p=>statusEfetivo(p)==='Em andamento').length,
-    atr:pendencias.filter(p=>statusEfetivo(p)==='Atrasada').length,
-    res:pendencias.filter(p=>p.status==='Resolvida').length,
-    val:pendencias.reduce((a,p)=>a+Number(p.valor),0),
-    slaMedia:calcularSlaMedia(pendencias),
+    total:pendenciasFiltradas.length,
+    pend:pendenciasFiltradas.filter(p=>statusEfetivo(p)==='Pendente').length,
+    and:pendenciasFiltradas.filter(p=>statusEfetivo(p)==='Em andamento').length,
+    atr:pendenciasFiltradas.filter(p=>statusEfetivo(p)==='Atrasada').length,
+    res:pendenciasFiltradas.filter(p=>p.status==='Resolvida').length,
+    val:pendenciasFiltradas.reduce((a,p)=>a+Number(p.valor),0),
+    slaMedia:calcularSlaMedia(pendenciasFiltradas),
   };
 
   const todosVisivelsSelecionados = filtered.length>0&&filtered.every(p=>selecionados.has(p.id));
@@ -553,6 +571,39 @@ export default function Home({ sessao }) {
       </div>
 
       {erro && <div style={{background:'#FEE2E2',color:'#991B1B',padding:'10px 24px',fontSize:12}}>{erro}</div>}
+
+      {/* BANNER PESSOAL — só para editores */}
+      {!isAdmin && lojasDoUsuario && lojasDoUsuario.length > 0 && (
+        <div style={{background:'#0a1e48',borderBottom:'1px solid rgba(255,255,255,.08)',padding:'10px 24px',display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8}}>
+          <div style={{display:'flex',alignItems:'center',gap:16}}>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:3,textTransform:'uppercase',color:'rgba(255,255,255,.4)'}}>
+              Suas lojas · {lojasDoUsuario.length} unidades
+            </div>
+            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+              {lojasDoUsuario.slice(0,6).map(l=>(
+                <span key={l} style={{fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,textTransform:'uppercase',padding:'2px 7px',background:'rgba(255,255,255,.08)',color:'rgba(255,255,255,.6)',borderRadius:3}}>{l}</span>
+              ))}
+              {lojasDoUsuario.length > 6 && (
+                <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:'rgba(255,255,255,.4)'}}>+{lojasDoUsuario.length - 6} mais</span>
+              )}
+            </div>
+          </div>
+          <div style={{display:'flex',gap:16}}>
+            <div style={{textAlign:'center'}}>
+              <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:20,color:'#FFCA03',lineHeight:1}}>{metrics.atr}</div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,textTransform:'uppercase',color:'rgba(255,255,255,.4)'}}>atrasadas</div>
+            </div>
+            <div style={{textAlign:'center'}}>
+              <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:20,color:contagemRevisao.critico>0?'#E8334A':'rgba(255,255,255,.6)',lineHeight:1}}>{contagemRevisao.critico}</div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,textTransform:'uppercase',color:'rgba(255,255,255,.4)'}}>críticas</div>
+            </div>
+            <div style={{textAlign:'center'}}>
+              <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:20,color:'#12B76A',lineHeight:1}}>{metrics.res}</div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,textTransform:'uppercase',color:'rgba(255,255,255,.4)'}}>resolvidas</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* IMPORT PANEL */}
       {isAdmin && (
