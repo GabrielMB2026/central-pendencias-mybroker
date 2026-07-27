@@ -3,74 +3,77 @@ import Head from 'next/head';
 import { useRouter } from 'next/router';
 import { supabase } from '../lib/supabase';
 
+const LOJAS_POR_GRUPO = {
+  'Yasmin': [
+    'PQ AMAZONIA','SETOR SUL','GARAVELO','ELDORADO','VILA BRASILIA',
+    'APARECIDA','SENADOR CANEDO','BALNEARIO CAMBORIU','NOROESTE',
+    'FLAMBOYANT','CUIABA','ARAES'
+  ],
+  'Ana Virginia': [
+    'UBERLANDIA','SANTA MONICA','BH','CAMPINAS','JOAO PESSOA',
+    'VITORIA','SAO JOSE DO RIO PRETO','RIBEIRAO PRETO','FLORIPA',
+    'DIAMOND','JARDIM AMERICA','ALPHAMALL'
+  ],
+  'Laly': [
+    'OFFICE','MARISTA','BUENA VISTA','AREIAO','SAO PAULO',
+    'ANAPOLIS','SALVADOR','BUENO','SERRINHA','PRACA DO SOL'
+  ],
+};
+
 export default function Admin({ sessao }) {
   const router = useRouter();
   const [perfil, setPerfil] = useState(null);
   const [usuarios, setUsuarios] = useState([]);
+  const [userLojas, setUserLojas] = useState({}); // { user_id: [loja, ...] }
   const [loading, setLoading] = useState(true);
   const [form, setForm] = useState({ nome: '', email: '', senha: '', role: 'editor' });
   const [criando, setCriando] = useState(false);
   const [erro, setErro] = useState('');
   const [sucesso, setSucesso] = useState('');
+  const [expandido, setExpandido] = useState(null); // user_id expandido para ver lojas
+  const [novaLoja, setNovaLoja] = useState('');
+  const [salvandoLojas, setSalvandoLojas] = useState(false);
 
-  useEffect(() => {
-    if (!sessao) return;
-    carregarDados();
-  }, [sessao]);
+  useEffect(() => { if (!sessao) return; carregarDados(); }, [sessao]);
 
   async function carregarDados() {
     setLoading(true);
-    // Busca perfil do usuário logado
-    const { data: p } = await supabase
-      .from('user_profiles')
-      .select('*')
-      .eq('id', sessao.user.id)
-      .single();
-
-    if (!p || p.role !== 'admin') {
-      router.replace('/');
-      return;
-    }
+    const { data: p } = await supabase.from('user_profiles').select('*').eq('id', sessao.user.id).single();
+    if (!p || p.role !== 'admin') { router.replace('/'); return; }
     setPerfil(p);
 
-    // Busca todos os usuários
-    const { data: users } = await supabase
-      .from('user_profiles')
-      .select('*')
-      .order('created_at', { ascending: true });
+    const { data: users } = await supabase.from('user_profiles').select('*').order('created_at', { ascending: true });
     setUsuarios(users || []);
+
+    const { data: lojas } = await supabase.from('user_lojas').select('*');
+    const map = {};
+    (lojas || []).forEach(l => {
+      if (!map[l.user_id]) map[l.user_id] = [];
+      map[l.user_id].push(l.loja);
+    });
+    setUserLojas(map);
     setLoading(false);
   }
 
   async function criarUsuario(e) {
     e.preventDefault();
     setErro(''); setSucesso(''); setCriando(true);
-
-    // Cria usuário via Supabase Admin API (service role) — aqui usamos a função RPC
     const { data, error } = await supabase.auth.admin.createUser({
-      email: form.email,
-      password: form.senha,
-      email_confirm: true,
+      email: form.email, password: form.senha, email_confirm: true,
       user_metadata: { nome: form.nome, role: form.role },
     });
-
     if (error) {
-      // Fallback: cria via signUp normal (sem admin API)
-      const { data: d2, error: e2 } = await supabase.auth.signUp({
-        email: form.email,
-        password: form.senha,
+      const { error: e2 } = await supabase.auth.signUp({
+        email: form.email, password: form.senha,
         options: { data: { nome: form.nome, role: form.role } },
       });
-      if (e2) { setErro('Erro ao criar usuário: ' + e2.message); setCriando(false); return; }
+      if (e2) { setErro('Erro: ' + e2.message); setCriando(false); return; }
     }
-
-    // Aguarda trigger criar o perfil e depois atualiza o role manualmente se necessário
     await new Promise(r => setTimeout(r, 1500));
     const { data: allUsers } = await supabase.from('user_profiles').select('*').eq('email', form.email);
     if (allUsers && allUsers.length > 0) {
       await supabase.from('user_profiles').update({ nome: form.nome, role: form.role }).eq('email', form.email);
     }
-
     setSucesso(`Usuário ${form.nome} criado com sucesso!`);
     setForm({ nome: '', email: '', senha: '', role: 'editor' });
     setCriando(false);
@@ -84,6 +87,35 @@ export default function Admin({ sessao }) {
 
   async function alterarRole(u, novoRole) {
     await supabase.from('user_profiles').update({ role: novoRole }).eq('id', u.id);
+    carregarDados();
+  }
+
+  // Aplica grupo pré-definido a um usuário
+  async function aplicarGrupo(userId, nomeGrupo) {
+    setSalvandoLojas(true);
+    const lojas = LOJAS_POR_GRUPO[nomeGrupo] || [];
+    // Remove lojas existentes
+    await supabase.from('user_lojas').delete().eq('user_id', userId);
+    // Insere as do grupo
+    if (lojas.length) {
+      await supabase.from('user_lojas').insert(lojas.map(l => ({ user_id: userId, loja: l })));
+    }
+    setSalvandoLojas(false);
+    carregarDados();
+  }
+
+  // Adiciona loja avulsa
+  async function adicionarLoja(userId) {
+    const l = novaLoja.trim().toUpperCase();
+    if (!l) return;
+    await supabase.from('user_lojas').upsert({ user_id: userId, loja: l });
+    setNovaLoja('');
+    carregarDados();
+  }
+
+  // Remove loja
+  async function removerLoja(userId, loja) {
+    await supabase.from('user_lojas').delete().eq('user_id', userId).eq('loja', loja);
     carregarDados();
   }
 
@@ -113,9 +145,9 @@ export default function Admin({ sessao }) {
         </div>
       </div>
 
-      <div style={{ maxWidth: 900, margin: '32px auto', padding: '0 24px' }}>
+      <div style={{ maxWidth: 960, margin: '32px auto', padding: '0 24px' }}>
 
-        {/* ── CRIAR USUÁRIO ── */}
+        {/* CRIAR USUÁRIO */}
         <div className="admin-card">
           <div className="admin-card-eyebrow">Novo usuário</div>
           <div className="admin-card-title">Cadastrar membro da equipe</div>
@@ -147,59 +179,161 @@ export default function Admin({ sessao }) {
           </form>
         </div>
 
-        {/* ── LISTA DE USUÁRIOS ── */}
+        {/* LISTA DE USUÁRIOS + LOJAS */}
         <div className="admin-card" style={{ marginTop: 16 }}>
           <div className="admin-card-eyebrow">Equipe cadastrada</div>
-          <div className="admin-card-title">Usuários ativos</div>
-          <table className="admin-table">
-            <thead>
-              <tr>
-                <th>Nome</th>
-                <th>E-mail</th>
-                <th>Perfil</th>
-                <th>Status</th>
-                <th>Ações</th>
-              </tr>
-            </thead>
-            <tbody>
-              {usuarios.map(u => (
-                <tr key={u.id} style={{ opacity: u.ativo ? 1 : .45 }}>
-                  <td style={{ fontWeight: 600 }}>
-                    {u.nome}
-                    {u.id === sessao.user.id && <span className="tag-voce">você</span>}
-                  </td>
-                  <td style={{ fontFamily: "'DM Mono',monospace", fontSize: 11 }}>{u.email}</td>
-                  <td>
-                    {u.id === sessao.user.id ? (
-                      <span className="role-badge admin">admin</span>
-                    ) : (
-                      <select
-                        className="role-sel"
-                        value={u.role}
-                        onChange={e => alterarRole(u, e.target.value)}
+          <div className="admin-card-title">Usuários e lojas vinculadas</div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {usuarios.map(u => {
+              const lojasDoUser = userLojas[u.id] || [];
+              const isExpanded = expandido === u.id;
+              const isMe = u.id === sessao.user.id;
+              return (
+                <div key={u.id} className="user-row-card" style={{ opacity: u.ativo ? 1 : .45 }}>
+                  {/* Linha principal */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ fontWeight: 600, fontSize: 13, color: '#1A2540' }}>{u.nome}</span>
+                        {isMe && <span className="tag-voce">você</span>}
+                        <span className={`role-badge ${u.role}`}>{u.role}</span>
+                        <span className={u.ativo ? 'status-ativo' : 'status-inativo'}>{u.ativo ? 'ativo' : 'inativo'}</span>
+                      </div>
+                      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: '#8A96B0', marginTop: 2 }}>{u.email}</div>
+                    </div>
+
+                    {/* Contagem de lojas */}
+                    <div style={{ textAlign: 'center', minWidth: 60 }}>
+                      <div style={{ fontSize: 18, fontWeight: 600, color: lojasDoUser.length ? '#1E43F9' : '#8A96B0' }}>{lojasDoUser.length}</div>
+                      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, letterSpacing: 2, textTransform: 'uppercase', color: '#8A96B0' }}>lojas</div>
+                    </div>
+
+                    {/* Ações */}
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      {!isMe && (
+                        <>
+                          <select className="role-sel" value={u.role} onChange={e => alterarRole(u, e.target.value)}>
+                            <option value="editor">editor</option>
+                            <option value="admin">admin</option>
+                          </select>
+                          <button className="row-btn" onClick={() => toggleAtivo(u)}>
+                            {u.ativo ? 'desativar' : 'reativar'}
+                          </button>
+                        </>
+                      )}
+                      <button
+                        className="row-btn"
+                        style={{ borderColor: isExpanded ? '#1E43F9' : undefined, color: isExpanded ? '#1E43F9' : undefined }}
+                        onClick={() => setExpandido(isExpanded ? null : u.id)}
                       >
-                        <option value="editor">editor</option>
-                        <option value="admin">admin</option>
-                      </select>
-                    )}
-                  </td>
-                  <td>
-                    <span className={u.ativo ? 'status-ativo' : 'status-inativo'}>
-                      {u.ativo ? 'ativo' : 'inativo'}
-                    </span>
-                  </td>
-                  <td>
-                    {u.id !== sessao.user.id && (
-                      <button className="row-btn" onClick={() => toggleAtivo(u)}>
-                        {u.ativo ? 'desativar' : 'reativar'}
+                        {isExpanded ? '▲ fechar' : '▼ lojas'}
                       </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                    </div>
+                  </div>
+
+                  {/* Painel de lojas expandido */}
+                  {isExpanded && (
+                    <div style={{ marginTop: 14, paddingTop: 14, borderTop: '1px solid #DDE2EF' }}>
+
+                      {/* Grupos pré-definidos */}
+                      <div style={{ marginBottom: 12 }}>
+                        <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, letterSpacing: 3, textTransform: 'uppercase', color: '#8A96B0', marginBottom: 8 }}>
+                          Aplicar grupo pré-definido
+                        </div>
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                          {Object.keys(LOJAS_POR_GRUPO).map(g => (
+                            <button
+                              key={g}
+                              className="chip"
+                              style={{ fontSize: 9, padding: '4px 10px' }}
+                              onClick={() => aplicarGrupo(u.id, g)}
+                              disabled={salvandoLojas}
+                            >
+                              {g} ({LOJAS_POR_GRUPO[g].length} lojas)
+                            </button>
+                          ))}
+                          <button
+                            className="row-btn"
+                            style={{ color: '#E8334A', borderColor: '#E8334A' }}
+                            onClick={() => aplicarGrupo(u.id, '__limpar__')}
+                            disabled={salvandoLojas}
+                          >
+                            limpar todas
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Lojas atuais */}
+                      {lojasDoUser.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, letterSpacing: 3, textTransform: 'uppercase', color: '#8A96B0', marginBottom: 8 }}>
+                            Lojas vinculadas ({lojasDoUser.length})
+                          </div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                            {lojasDoUser.sort().map(l => (
+                              <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 4, background: '#F4F6FB', border: '1px solid #DDE2EF', padding: '3px 8px', borderRadius: 4 }}>
+                                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: '#1A2540' }}>{l}</span>
+                                <button
+                                  onClick={() => removerLoja(u.id, l)}
+                                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#8A96B0', fontSize: 12, lineHeight: 1, padding: '0 2px' }}
+                                  title="Remover"
+                                >×</button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Adicionar loja avulsa */}
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <input
+                          type="text"
+                          placeholder="Adicionar loja avulsa..."
+                          value={novaLoja}
+                          onChange={e => setNovaLoja(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && adicionarLoja(u.id)}
+                          style={{ flex: 1, height: 32, padding: '0 10px', border: '1px solid #DDE2EF', fontSize: 12, fontFamily: "'DM Sans',sans-serif", color: '#1A2540' }}
+                        />
+                        <button className="btn btn-primary" style={{ padding: '0 14px', fontSize: 11 }} onClick={() => adicionarLoja(u.id)}>
+                          + Adicionar
+                        </button>
+                      </div>
+
+                      {/* Aviso se admin */}
+                      {u.role === 'admin' && (
+                        <div style={{ marginTop: 10, padding: '8px 12px', background: '#E6F1FB', borderLeft: '3px solid #1E43F9', fontSize: 11, color: '#185FA5' }}>
+                          Usuário admin vê todas as pendências independente das lojas vinculadas.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
+
+        {/* REFERÊNCIA DE GRUPOS */}
+        <div className="admin-card" style={{ marginTop: 16 }}>
+          <div className="admin-card-eyebrow">Referência</div>
+          <div className="admin-card-title">Grupos pré-definidos</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+            {Object.entries(LOJAS_POR_GRUPO).map(([nome, lojas]) => (
+              <div key={nome}>
+                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, letterSpacing: 3, textTransform: 'uppercase', color: '#1E43F9', marginBottom: 8, fontWeight: 600 }}>
+                  {nome} · {lojas.length} lojas
+                </div>
+                {lojas.map(l => (
+                  <div key={l} style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: '#4A5578', padding: '2px 0', borderBottom: '1px solid #F4F6FB' }}>
+                    {l}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+
       </div>
 
       <style>{`
@@ -214,12 +348,11 @@ export default function Admin({ sessao }) {
         .admin-erro { grid-column:1/-1; background:#FEE2E2; color:#991B1B; padding:10px; font-size:12px; border-left:3px solid #E8334A; }
         .admin-sucesso { grid-column:1/-1; background:#DCFCE7; color:#0A7A48; padding:10px; font-size:12px; border-left:3px solid #12B76A; }
         .admin-form .btn { grid-column:1/-1; padding:11px; font-size:11px; }
-        .admin-table { width:100%; border-collapse:collapse; margin-top:12px; font-size:12px; }
-        .admin-table th { font-family:'DM Mono',monospace; font-size:8px; letter-spacing:3px; text-transform:uppercase; color:#8A96B0; padding:8px 10px; border-bottom:2px solid #DDE2EF; text-align:left; }
-        .admin-table td { padding:10px 10px; border-bottom:1px solid #DDE2EF; color:#1A2540; }
-        .tag-voce { display:inline-flex; margin-left:6px; padding:1px 6px; background:#E6F1FB; color:#1E43F9; font-family:'DM Mono',monospace; font-size:8px; letter-spacing:2px; text-transform:uppercase; }
+        .user-row-card { background:#fff; border:1px solid #DDE2EF; padding:14px 16px; border-radius:6px; }
+        .tag-voce { display:inline-flex; padding:1px 6px; background:#E6F1FB; color:#1E43F9; font-family:'DM Mono',monospace; font-size:8px; letter-spacing:2px; text-transform:uppercase; }
         .role-badge { display:inline-flex; padding:2px 8px; font-family:'DM Mono',monospace; font-size:8px; letter-spacing:2px; text-transform:uppercase; font-weight:600; }
         .role-badge.admin { background:rgba(30,67,249,.1); color:#1E43F9; }
+        .role-badge.editor { background:rgba(138,150,176,.12); color:#4A5578; }
         .role-sel { font-family:'DM Mono',monospace; font-size:9px; letter-spacing:2px; text-transform:uppercase; padding:3px 6px; border:1px solid #DDE2EF; color:#1A2540; background:#fff; cursor:pointer; }
         .status-ativo { font-family:'DM Mono',monospace; font-size:8px; letter-spacing:2px; text-transform:uppercase; color:#0A7A48; }
         .status-inativo { font-family:'DM Mono',monospace; font-size:8px; letter-spacing:2px; text-transform:uppercase; color:#8A96B0; }
