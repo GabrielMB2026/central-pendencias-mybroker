@@ -358,6 +358,19 @@ export default function Home({ sessao }) {
     const m={}; cols.forEach((col,i)=>{m[i]=guessField(col);}); setMapping(m);
   }
 
+  // Converte o mapping (índice de coluna → campo) para (campo → índice de coluna),
+  // que é o formato que gerarLinhasRevisao() precisa para montar as linhas editáveis.
+  // Esta função estava faltando e era a causa da tela de revisão não abrir.
+  function getMappingByField() {
+    const m = {};
+    Object.entries(mapping).forEach(([idx, field]) => {
+      if (field && field !== 'ignorar') {
+        m[field] = parseInt(idx, 10);
+      }
+    });
+    return m;
+  }
+
   // Etapa 2: monta linhas editáveis a partir do mapeamento
   function gerarLinhasRevisao() {
     const map = getMappingByField();
