@@ -5,6 +5,24 @@ import * as XLSX from 'xlsx';
 import { supabase } from '../lib/supabase';
 
 /* ── Parser ERP ── */
+
+// Fallback para quando o texto não usa "-" para separar pagador,
+// empreendimento e proposta (ex.: separado só por espaço ou "/").
+// Localiza a primeira sequência de 5+ dígitos (a proposta) e usa
+// essa posição como âncora: tudo antes vira pagador, tudo depois
+// vira empreendimento.
+// Ex.: "Fulano /326706 LOTEAMENTO X"  → nome=Fulano, prop=326706, resto=LOTEAMENTO X
+//      "Fulano 326706 LOTEAMENTO X"   → mesmo resultado (sem a barra)
+function extraiPorAncoragemNumero(texto) {
+  const m = String(texto || '').match(/^(.*?)\s*\/?\s*(\d{5,})\s*(.*)$/);
+  if (!m) return null;
+  const nome = m[1].trim();
+  const prop = m[2];
+  const resto = m[3].trim();
+  if (!nome && !resto) return null;
+  return { nome, prop, resto };
+}
+
 function parseCamposERP(raw) {
   const s = String(raw || '').trim();
   const result = { pagador:'', proposta:'', empreendimento:'', unidade:'', statusVenda:'', confianca:'baixa' };
@@ -43,6 +61,23 @@ function parseCamposERP(raw) {
   if (ep0 && ep0.nome) { result.pagador=ep0.nome; result.proposta=ep0.prop; result.confianca='alta'; }
   else if (ep0 && !ep0.nome) { result.proposta=ep0.prop; result.confianca='media'; }
   else if (/^proposta$/i.test(blocos[0])) { result.confianca='baixa'; }
+  else if (blocos.length===1) {
+    // Fallback: texto sem "-" separando pagador/empreendimento/proposta
+    // (ex.: separado só por espaço ou "/"). Usa o número da proposta
+    // como âncora — tudo antes vira pagador, tudo depois vira empreendimento.
+    const porNumero = extraiPorAncoragemNumero(blocos[0]);
+    if (porNumero) {
+      // Pode vir sem nome de pagador (ex.: "323131 LOTEAMENTO X"),
+      // só com proposta + empreendimento — nesse caso pagador fica vazio
+      // mesmo, para ser preenchido manualmente na revisão.
+      if (porNumero.nome) result.pagador = porNumero.nome;
+      result.proposta = porNumero.prop;
+      if (porNumero.resto) result.empreendimento = porNumero.resto;
+      result.confianca = 'media'; // heurística nova, ainda merece revisão manual
+    } else {
+      result.pagador=blocos[0]; result.confianca='media';
+    }
+  }
   else { result.pagador=blocos[0]; result.confianca='media'; }
   for (let i=1;i<blocos.length;i++) {
     const epi = extraiProposta(blocos[i]);
