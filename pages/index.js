@@ -283,8 +283,14 @@ export default function Home({ sessao }) {
 
   useEffect(()=>{loadPendencias();},[loadPendencias]);
 
-  // Lista de lojas únicas para o filtro
+  // Lista de lojas únicas para o filtro manual
   const lojas = [...new Set(pendencias.map(p=>p.loja).filter(Boolean))].sort();
+
+  // Loja do usuário logado — se definida e não for admin, restringe a visão automaticamente
+  // Array de lojas do editor — null ou vazio = sem restrição (vê tudo)
+  const lojasDoUsuario = (!isAdmin && Array.isArray(perfil?.lojas) && perfil.lojas.length > 0)
+    ? perfil.lojas
+    : null;
 
   // Limpa todos os filtros
   function limparFiltros() {
@@ -298,6 +304,8 @@ export default function Home({ sessao }) {
   /* ── Filtragem + Ordenação ── */
   const filtered = (() => {
     let lista = pendencias.filter(p=>{
+      // Filtro automático por loja do usuário (editor com loja definida)
+      if(lojasDoUsuario && !lojasDoUsuario.includes(p.loja)) return false;
       const b = busca.toLowerCase();
       const bOk = !b||[p.pagador,p.empreendimento,p.proposta,p.loja,p.id].some(x=>(x||'').toLowerCase().includes(b));
       if(!bOk) return false;
@@ -573,6 +581,11 @@ export default function Home({ sessao }) {
           <div className="user-pill">
             <span className="user-nome">{perfil?.nome||sessao?.user?.email}</span>
             <span className={'user-role '+(isAdmin?'role-admin':'role-editor')}>{isAdmin?'admin':'editor'}</span>
+            {lojasDoUsuario && (
+              <span className="user-loja" title={'Você vê apenas: '+lojasDoUsuario.join(', ')}>
+                🏢 {lojasDoUsuario.length === 1 ? lojasDoUsuario[0] : lojasDoUsuario.length+' lojas'}
+              </span>
+            )}
             {isAdmin && <button className="user-btn" onClick={()=>router.push('/admin')} title="Gerenciar usuários">⚙</button>}
             <button className="user-btn" onClick={()=>router.push('/dashboard')} title="Dashboard">📊</button>
             <button className="user-btn" onClick={handleLogout} title="Sair">⏻</button>
@@ -732,13 +745,15 @@ export default function Home({ sessao }) {
                 <option>Documentação</option><option>Pagamento</option><option>Assinatura</option><option>Vistoria</option><option>Outro</option>
               </select>
             </div>
-            <div className="filtro-grupo">
-              <label className="filtro-label">Loja / C.Custo</label>
-              <select className="filtro-sel" value={fLoja} onChange={e=>setFLoja(e.target.value)}>
-                <option value="">Todas as lojas</option>
-                {lojas.map(l=><option key={l} value={l}>{l}</option>)}
-              </select>
-            </div>
+            {!lojasDoUsuario && (
+              <div className="filtro-grupo">
+                <label className="filtro-label">Loja / C.Custo</label>
+                <select className="filtro-sel" value={fLoja} onChange={e=>setFLoja(e.target.value)}>
+                  <option value="">Todas as lojas</option>
+                  {lojas.map(l=><option key={l} value={l}>{l}</option>)}
+                </select>
+              </div>
+            )}
             <div className="filtro-grupo">
               <label className="filtro-label">Data Receb. — De</label>
               <input className="filtro-sel" type="text" placeholder="DD/MM/AAAA" value={fDataDe} onChange={e=>setFDataDe(e.target.value)}/>
@@ -939,6 +954,7 @@ export default function Home({ sessao }) {
         .role-admin{background:rgba(255,202,3,.2);color:#FFCA03;}
         .role-editor{background:rgba(255,255,255,.1);color:rgba(255,255,255,.5);}
         .user-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.6);width:26px;height:26px;cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;transition:all .15s;}
+        .user-loja{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;text-transform:uppercase;padding:2px 7px;background:rgba(255,202,3,.15);color:var(--yellow);border:1px solid rgba(255,202,3,.3);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
         .user-btn:hover{background:rgba(255,255,255,.18);color:#fff;}
         .cb{width:15px;height:15px;cursor:pointer;accent-color:var(--blue);}
         tr.row-selected td{background:rgba(30,67,249,.06)!important;}
