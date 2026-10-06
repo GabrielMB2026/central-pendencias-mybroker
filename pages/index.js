@@ -4,116 +4,13 @@ import { useRouter } from 'next/router';
 import * as XLSX from 'xlsx';
 import { supabase } from '../lib/supabase';
 
-/* ── Parser ERP ── */
-function extraiPorAncoragemNumero(texto) {
-  const m = String(texto || '').match(/^(.*?)\s*\/?\s*(\d{5,})\s*(.*)$/);
-  if (!m) return null;
-  const nome = m[1].trim(); const prop = m[2]; const resto = m[3].trim();
-  if (!nome && !resto) return null;
-  return { nome, prop, resto };
-}
-
-function parseCamposERP(raw) {
-  const s = String(raw || '').trim();
-  const result = { pagador:'', proposta:'', empreendimento:'', unidade:'', statusVenda:'', confianca:'baixa' };
-  if (!s) return result;
-  let limpo = s.replace(/^Recebimentos\s*\[[^\]]*\]\s*-?\s*/i,'').trim().replace(/`/g,'').trim();
-  if (!limpo) return result;
-  let statusVenda = '';
-  const vm = limpo.match(/VENDA\s+NA\s+ABA[:\-]?\s*(.+)$/i);
-  if (vm) { statusVenda = 'Venda na aba: ' + vm[1].trim(); limpo = limpo.slice(0,vm.index).trim(); }
-  const pm = limpo.match(/\(([^)]+)\)\s*$/);
-  if (pm) { statusVenda = (statusVenda ? statusVenda+' · ':'')+pm[1].trim(); limpo = limpo.slice(0,pm.index).trim(); }
-  result.statusVenda = statusVenda;
-  limpo = limpo.replace(/[-\/]\s*$/,'').trim();
-  if (!limpo) return result;
-  let unidade = '';
-  const um = limpo.match(/^(.*?)\s*-?\s*(Unidade\s+.*?(?:Bl\/?Qd\s*[\w\-]*)?)\s*$/i);
-  if (um && um[2]) { unidade = um[2].trim(); limpo = um[1].trim(); }
-  result.unidade = unidade;
-  limpo = limpo.replace(/[-\/]\s*$/,'').trim();
-  const mProp = limpo.match(/^proposta\s*[:\-]?\s*(\d+)\s*$/i);
-  if (mProp) { result.proposta = mProp[1]; result.confianca = 'alta'; return result; }
-  const blocos = limpo.split(/\s+-\s+/).map(b=>b.trim()).filter(Boolean);
-  if (!blocos.length) return result;
-  function extraiProposta(bloco) {
-    let m = bloco.match(/^(.*?)[\/]\s*(\d{5,})\s*$/);
-    if (m) return { nome:m[1].trim(), prop:m[2] };
-    m = bloco.match(/^(.*?)\s+(\d{5,})\s*$/);
-    if (m) return { nome:m[1].trim(), prop:m[2] };
-    m = bloco.match(/^(\d{5,})\s*$/);
-    if (m) return { nome:'', prop:m[1] };
-    m = bloco.match(/^proposta\s*[:\-]?\s*(\d+)\s*(.*)$/i);
-    if (m) return { nome:m[2]?m[2].trim():'', prop:m[1] };
-    return null;
-  }
-  const ep0 = extraiProposta(blocos[0]);
-  if (ep0 && ep0.nome) { result.pagador=ep0.nome; result.proposta=ep0.prop; result.confianca='alta'; }
-  else if (ep0 && !ep0.nome) { result.proposta=ep0.prop; result.confianca='media'; }
-  else if (/^proposta$/i.test(blocos[0])) { result.confianca='baixa'; }
-  else if (blocos.length===1) {
-    const porNumero = extraiPorAncoragemNumero(blocos[0]);
-    if (porNumero) {
-      if (porNumero.nome) result.pagador = porNumero.nome;
-      result.proposta = porNumero.prop;
-      if (porNumero.resto) result.empreendimento = porNumero.resto;
-      result.confianca = 'media';
-    } else { result.pagador=blocos[0]; result.confianca='media'; }
-  } else { result.pagador=blocos[0]; result.confianca='media'; }
-  for (let i=1;i<blocos.length;i++) {
-    const epi = extraiProposta(blocos[i]);
-    if (epi) { if(epi.prop&&!result.proposta)result.proposta=epi.prop; if(epi.nome&&!result.empreendimento)result.empreendimento=epi.nome; continue; }
-    if (/^proposta$/i.test(blocos[i])) continue;
-    if (!result.empreendimento) result.empreendimento=blocos[i]; else result.empreendimento+=' · '+blocos[i];
-  }
-  if (!result.pagador&&!result.empreendimento&&!result.proposta) { result.pagador=blocos.join(' - '); result.confianca='baixa'; }
-  return result;
-}
-
-function extrairObsERP(raw) {
-  const r = parseCamposERP(raw);
-  return [r.unidade, r.statusVenda].filter(Boolean).join(' · ');
-}
-
-const CAMPOS_DESTINO = [
-  { key:'ccusto', label:'C.Custo / Loja' },
-  { key:'contrato', label:'Contrato (texto rico — será separado automaticamente)' },
-  { key:'descricao', label:'Descrição (obs)' },
-  { key:'pagador', label:'Pagador (já separado)' },
-  { key:'empreendimento', label:'Empreendimento (já separado)' },
-  { key:'proposta', label:'Proposta (já separado)' },
-  { key:'data', label:'Data Receb.' },
-  { key:'valor', label:'Valor' },
-  { key:'ignorar', label:'— Ignorar —' },
-];
-
-const HEURISTICS = {
-  ccusto:['c.custo','ccusto','centro','custo','loja','setor','cc'],
-  contrato:['contrato'],
-  descricao:['descri','desc'],
-  pagador:['pagador'],
-  empreendimento:['empreend','empreendimento','imovel','produto'],
-  proposta:['proposta','venda','numdoc','documento'],
-  data:['data','date','receb','venc'],
-  valor:['valor','value','total','vlr','vl'],
-};
-
-const COLUNAS_IGNORAR_EXATAS = ['mes','ano','mes/ano','cliente','tipo','status'];
-
-function guessField(col) {
-  const lc = col.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-  if (COLUNAS_IGNORAR_EXATAS.includes(lc)) return 'ignorar';
-  for (const [k,kws] of Object.entries(HEURISTICS)) if (kws.some(kw=>lc.includes(kw))) return k;
-  return 'ignorar';
-}
-
+function fmt(v) { return 'R$ '+Number(v||0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function parseValor(raw) {
   if (!raw && raw!==0) return 0;
   const s = String(raw).replace(/[^\d,\.]/g,'');
   const n = s.includes(',')&&s.includes('.') ? s.replace(/\./g,'').replace(',','.') : s.replace(',','.');
   return parseFloat(n)||0;
 }
-
 function parseData(raw) {
   if (!raw) return '';
   const s = String(raw).trim();
@@ -128,899 +25,1034 @@ function parseData(raw) {
   }
   return s;
 }
-
-// Converte "DD/MM/YYYY" em Date para comparações — retorna null se inválido
-function parseDateBR(s) {
-  if (!s) return null;
-  const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if (!m) return null;
-  const ano = m[3].length===2 ? 2000+parseInt(m[3],10) : parseInt(m[3],10);
-  return new Date(ano, parseInt(m[2],10)-1, parseInt(m[1],10));
-}
-
-function fmt(v) { return 'R$ '+Number(v).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}); }
-function badge(s) { const m={Pendente:'bp','Em andamento':'ba',Atrasada:'bat',Resolvida:'br'}; return {cls:m[s]||'bp',label:s}; }
 function nextId(existing) {
   let max=0;
-  existing.forEach(p=>{const m=String(p.id).match(/PND-(\d+)/);if(m)max=Math.max(max,parseInt(m[1],10));});
-  return 'PND-'+String(max+1).padStart(3,'0');
+  existing.forEach(n=>{const m=String(n.id).match(/NEG-(\d+)/);if(m)max=Math.max(max,parseInt(m[1],10));});
+  return 'NEG-'+String(max+1).padStart(3,'0');
 }
 
-/* ── SLA ── */
-const SLA_PADRAO_DIAS = 1;
+const CAMPOS_IMPORT = [
+  {key:'nome_completo', label:'Nome do cliente'},
+  {key:'empreendimento', label:'Empreendimento'},
+  {key:'responsavel_venda', label:'Responsável pela venda'},
+  {key:'situacao', label:'Situação'},
+  {key:'valor_divida', label:'Valor da dívida'},
+  {key:'data_vencimento', label:'Data de vencimento'},
+  {key:'numero_contrato', label:'Número do contrato'},
+  {key:'obs', label:'Observações'},
+  {key:'ignorar', label:'— Ignorar —'},
+];
 
-function parseDataCurta(s) {
-  if (!s) return null;
-  const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})/);
-  if (!m) return null;
-  const dt = new Date(new Date().getFullYear(), parseInt(m[2],10)-1, parseInt(m[1],10));
-  return isNaN(dt.getTime()) ? null : dt;
-}
-function dataUltimaMovimentacao(historico) {
-  if (!historico?.length) return null;
-  return parseDataCurta(historico[historico.length-1]);
-}
-function dataCriacaoDoHistorico(historico) {
-  if (!historico?.length) return null;
-  return parseDataCurta(historico[0]);
-}
-function dataResolucaoDoHistorico(historico) {
-  if (!historico?.length) return null;
-  for (let i=historico.length-1;i>=0;i--) {
-    if (/resolvid/i.test(String(historico[i]))) return parseDataCurta(historico[i]);
-  }
-  return null;
-}
-function diasDesdeUltimaMovimentacao(p) {
-  const dt = dataUltimaMovimentacao(p.historico)||dataCriacaoDoHistorico(p.historico);
-  if (!dt) return null;
-  const hoje = new Date(); hoje.setHours(0,0,0,0); dt.setHours(0,0,0,0);
-  return Math.round((hoje-dt)/86400000);
-}
-function statusEfetivo(p) {
-  if (p.status==='Resolvida') return 'Resolvida';
-  const dias = diasDesdeUltimaMovimentacao(p);
-  if (dias!==null && dias>SLA_PADRAO_DIAS) return 'Atrasada';
-  return p.status;
-}
-function calcularSlaMedia(pendencias) {
-  const tempos=[];
-  pendencias.filter(p=>p.status==='Resolvida').forEach(p=>{
-    const inicio=dataCriacaoDoHistorico(p.historico);
-    const fim=dataResolucaoDoHistorico(p.historico);
-    if(inicio&&fim){const d=Math.round((fim-inicio)/86400000);if(d>=0)tempos.push(d);}
-  });
-  if(!tempos.length) return null;
-  return Math.round((tempos.reduce((a,b)=>a+b,0)/tempos.length)*10)/10;
+function guessField(col) {
+  const lc = col.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  if (/nome|cliente|pagador/.test(lc)) return 'nome_completo';
+  if (/empreend|produto|imovel/.test(lc)) return 'empreendimento';
+  if (/responsav|vendedor|corretor/.test(lc)) return 'responsavel_venda';
+  if (/valor|divida|debito|vlr/.test(lc)) return 'valor_divida';
+  if (/data|venc|prazo/.test(lc)) return 'data_vencimento';
+  if (/contrato|numero|num/.test(lc)) return 'numero_contrato';
+  if (/situac|status_sit|sit/.test(lc)) return 'situacao';
+  if (/obs|nota|descri/.test(lc)) return 'obs';
+  return 'ignorar';
 }
 
 export default function Home({ sessao }) {
   const router = useRouter();
   const [perfil, setPerfil] = useState(null);
   const isAdmin = perfil?.role==='admin';
+  const isGestor = perfil?.role==='gestor';
+  const podeGerenciar = isAdmin||isGestor;
 
-  const [pendencias, setPendencias] = useState([]);
+  const [negs, setNegs] = useState([]);
+  const [statusList, setStatusList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [erro, setErro] = useState('');
 
-  /* ── Filtros ── */
   const [busca, setBusca] = useState('');
   const [fStatus, setFStatus] = useState('');
-  const [fTipo, setFTipo] = useState('');
-  const [fLoja, setFLoja] = useState('');
+  const [filtrosAbertos, setFiltrosAbertos] = useState(false);
   const [fDataDe, setFDataDe] = useState('');
   const [fDataAte, setFDataAte] = useState('');
-  const [filtrosAbertos, setFiltrosAbertos] = useState(false);
 
-  /* ── Ordenação ── */
-  const [sortCol, setSortCol] = useState(''); // campo pelo qual ordenar
-  const [sortDir, setSortDir] = useState('asc'); // 'asc' | 'desc'
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState({});
+  const [histNew, setHistNew] = useState('');
 
-  function toggleSort(col) {
-    if (sortCol===col) setSortDir(d=>d==='asc'?'desc':'asc');
-    else { setSortCol(col); setSortDir('asc'); }
+  // ── Anexos ──
+  const [anexos, setAnexos] = useState([]);
+  const [uploadingAnexo, setUploadingAnexo] = useState(false);
+  const anexoInputRef = useRef(null);
+
+  async function carregarAnexos(negId) {
+    const { data } = await supabase.from('anexos').select('*').eq('negociacao_id', negId).order('created_at');
+    setAnexos(data || []);
   }
 
-  function SortIcon({ col }) {
-    if (sortCol!==col) return <span style={{opacity:.25,marginLeft:3}}>⇅</span>;
-    return <span style={{marginLeft:3,color:'var(--yellow)'}}>{sortDir==='asc'?'↑':'↓'}</span>;
+  async function uploadAnexo(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const ext = file.name.split('.').pop().toLowerCase();
+    const tipo = ['pdf'].includes(ext) ? 'pdf' : 'image';
+    const path = `${editingId}/${Date.now()}_${file.name.replace(/\s/g,'_')}`;
+    setUploadingAnexo(true);
+    const { error: upErr } = await supabase.storage.from('anexos').upload(path, file, { upsert: false });
+    if (upErr) { showToast('Erro no upload: '+upErr.message); setUploadingAnexo(false); return; }
+    await supabase.from('anexos').insert({
+      negociacao_id: editingId,
+      nome_arquivo: file.name,
+      tipo,
+      tamanho: file.size,
+      storage_path: path,
+      enviado_por: sessao.user.id,
+      enviado_por_nome: perfil?.nome || sessao.user.email,
+    });
+    setUploadingAnexo(false);
+    if (anexoInputRef.current) anexoInputRef.current.value = '';
+    await carregarAnexos(editingId);
+    showToast('Arquivo anexado!');
   }
 
-  /* ── Seleção múltipla ── */
-  const [selecionados, setSelecionados] = useState(new Set());
-  const [deletandoLote, setDeletandoLote] = useState(false);
+  async function abrirAnexo(path) {
+    const { data } = await supabase.storage.from('anexos').createSignedUrl(path, 60);
+    if (data?.signedUrl) window.open(data.signedUrl, '_blank');
+  }
 
-  /* ── Importação ── */
+  async function excluirAnexo(id, path) {
+    if (!confirm('Remover este anexo?')) return;
+    await supabase.storage.from('anexos').remove([path]);
+    await supabase.from('anexos').delete().eq('id', id);
+    await carregarAnexos(editingId);
+    showToast('Anexo removido.');
+  }
+
+  function fmtTamanho(bytes) {
+    if (bytes < 1024) return bytes+'B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(0)+'KB';
+    return (bytes/(1024*1024)).toFixed(1)+'MB';
+  }
+
+  // ── Parcelas ──
+  const [parcelas, setParcelas] = useState([]);
+
+  function addParcela() {
+    setParcelas(prev => [...prev, { id: 'p_'+Date.now()+'_'+Math.random().toString(36).slice(2,6), data:'', valor:'', status:'pendente' }]);
+  }
+  function removeParcela(id) {
+    setParcelas(prev => prev.filter(p => p.id !== id));
+  }
+  function updateParcela(id, campo, valor) {
+    setParcelas(prev => prev.map(p => p.id === id ? {...p, [campo]: valor} : p));
+  }
+  function gerarParcelasAuto() {
+    const qtd = parseInt(form.parcelas_qtd || 0);
+    const valorTotal = parseFloat(String(form.valor_divida || '0').replace(',', '.')) || 0;
+    const dataBase = form.data_vencimento;
+    if (!qtd || qtd < 1) return;
+    const valorParcela = valorTotal > 0 ? Math.round((valorTotal / qtd) * 100) / 100 : 0;
+    const novas = [];
+    for (let i = 0; i < qtd; i++) {
+      let dataP = '';
+      if (dataBase) {
+        const [d, m, y] = dataBase.split('/').map(Number);
+        if (d && m && y) {
+          const dt = new Date(y, m - 1 + i, d);
+          dataP = String(dt.getDate()).padStart(2,'0') + '/' + String(dt.getMonth()+1).padStart(2,'0') + '/' + dt.getFullYear();
+        }
+      }
+      novas.push({ id: 'p_'+(Date.now()+i)+'_'+i, data: dataP, valor: valorParcela || '', status: 'pendente' });
+    }
+    setParcelas(novas);
+  }
+
   const [importOpen, setImportOpen] = useState(false);
   const [importStep, setImportStep] = useState(1);
   const [detectedCols, setDetectedCols] = useState([]);
   const [importedRows, setImportedRows] = useState([]);
   const [mapping, setMapping] = useState({});
   const [fileName, setFileName] = useState('');
-  const [previewRows, setPreviewRows] = useState([]);
   const [linhasRevisao, setLinhasRevisao] = useState([]);
-
-  /* ── Modal ── */
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState({});
-  const [histNew, setHistNew] = useState('');
+  const fileInputRef = useRef(null);
 
   const [toast, setToast] = useState('');
   const toastTimer = useRef(null);
-  const fileInputRef = useRef(null);
-
   const showToast = useCallback((msg)=>{
     setToast(msg);
     if(toastTimer.current) clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(()=>setToast(''),3500);
   },[]);
 
-  useEffect(()=>{
-    if(!sessao) return;
-    supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single()
-      .then(({data})=>setPerfil(data));
+  useEffect(()=>{ if(sessao) carregar(); },[sessao]);
+
+  const carregar = useCallback(async()=>{
+    setLoading(true);
+    const [{ data:p }, { data:n }, { data:st }] = await Promise.all([
+      supabase.from('user_profiles').select('*').eq('id',sessao.user.id).single(),
+      supabase.from('negociacoes').select('*, clientes(*), status_config(*)').order('created_at',{ascending:false}),
+      supabase.from('status_config').select('*').eq('ativo',true).order('ordem'),
+    ]);
+    const role = p?.role || 'operador';
+    const todosStatus = st || [];
+
+    // ── Regras automáticas: verifica transições por prazo de vencimento ──
+    const hoje = new Date(); hoje.setHours(0,0,0,0);
+
+    // Função: dado diasDesdeVenc, percorre a cadeia de status e retorna
+    // o status correto com base nos prazos configurados
+    function statusCorreto(diasDesdeVenc) {
+      // Pega todos status ordenados com prazo definido
+      const comPrazo = todosStatus
+        .filter(s => s.prazo_dias && s.proximo_status_id)
+        .sort((a, b) => b.prazo_dias - a.prazo_dias); // maior prazo primeiro
+      for (const s of comPrazo) {
+        if (diasDesdeVenc >= s.prazo_dias) {
+          // Retorna o próximo status desse estágio
+          return todosStatus.find(x => x.id === s.proximo_status_id) || null;
+        }
+      }
+      return null; // ainda dentro do prazo, sem mudança
+    }
+
+    for (const neg of (n||[])) {
+      if (!neg.data_vencimento) continue;
+      const partes = String(neg.data_vencimento).split('/');
+      if (partes.length !== 3) continue;
+      const dtVenc = new Date(parseInt(partes[2]), parseInt(partes[1])-1, parseInt(partes[0]));
+      dtVenc.setHours(0,0,0,0);
+      const diasDesdeVenc = Math.round((hoje - dtVenc) / 86400000);
+
+      // Verifica transição do status atual (se tiver próximo configurado)
+      const stAtual = todosStatus.find(s => s.id === neg.status_id);
+      if (stAtual && stAtual.proximo_status_id && stAtual.prazo_dias && diasDesdeVenc >= stAtual.prazo_dias) {
+        const proxStatus = todosStatus.find(s => s.id === stAtual.proximo_status_id);
+        const dateStr = hoje.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
+        const hist = Array.isArray(neg.historico) ? neg.historico : [];
+        const novoHist = [...hist,
+          `${dateStr} - Status alterado automaticamente: "${stAtual.nome}" → "${proxStatus?.nome||'?'}" (${diasDesdeVenc} dias desde o vencimento)`
+        ];
+        await supabase.from('negociacoes').update({
+          status_id: stAtual.proximo_status_id,
+          responsavel_cobranca: proxStatus?.responsavel || neg.responsavel_cobranca,
+          historico: novoHist,
+          updated_at: new Date().toISOString(),
+        }).eq('id', neg.id);
+        neg.status_id = stAtual.proximo_status_id;
+        neg.responsavel_cobranca = proxStatus?.responsavel || neg.responsavel_cobranca;
+        neg.historico = novoHist;
+      }
+      // Se o status atual NÃO tem regra configurada mas o vencimento já passou,
+      // encontra o status correto percorrendo a cadeia
+      else if (diasDesdeVenc > 0 && stAtual && !stAtual.prazo_dias) {
+        const stCorreto = statusCorreto(diasDesdeVenc);
+        if (stCorreto && stCorreto.id !== neg.status_id) {
+          const dateStr = hoje.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
+          const hist = Array.isArray(neg.historico) ? neg.historico : [];
+          const novoHist = [...hist,
+            `${dateStr} - Status corrigido automaticamente: "${stAtual.nome}" → "${stCorreto.nome}" (${diasDesdeVenc} dias desde o vencimento)`
+          ];
+          await supabase.from('negociacoes').update({
+            status_id: stCorreto.id,
+            responsavel_cobranca: stCorreto.responsavel || neg.responsavel_cobranca,
+            historico: novoHist,
+            updated_at: new Date().toISOString(),
+          }).eq('id', neg.id);
+          neg.status_id = stCorreto.id;
+          neg.responsavel_cobranca = stCorreto.responsavel || neg.responsavel_cobranca;
+          neg.historico = novoHist;
+        }
+      }
+    }
+
+    // ── Filtra status e negociações visíveis para o perfil ──
+    const statusVisiveis = todosStatus.filter(s =>
+      !s.perfis_visiveis || s.perfis_visiveis.length === 0 || s.perfis_visiveis.includes(role)
+    );
+    const idsVisiveis = new Set(statusVisiveis.map(s => s.id));
+    const negsFiltradas = (n||[]).filter(neg => !neg.status_id || idsVisiveis.has(neg.status_id));
+
+    setPerfil(p); setNegs(negsFiltradas); setStatusList(statusVisiveis);
+    setLoading(false);
   },[sessao]);
 
-  const loadPendencias = useCallback(async()=>{
-    setLoading(true); setErro('');
-    const {data,error}=await supabase.from('pendencias').select('*').order('created_at',{ascending:true});
-    if(error){setErro('Erro ao carregar: '+error.message);setLoading(false);return;}
-    setPendencias((data||[]).map(row=>({
-      id:row.id, loja:row.loja||'', pagador:row.pagador||'',
-      empreendimento:row.empreendimento||'', proposta:row.proposta||'',
-      dataReceb:row.data_receb||'', valor:Number(row.valor)||0,
-      tipo:row.tipo||'Documentação', status:row.status||'Pendente',
-      responsavel:row.responsavel||'', acao:row.acao||'', obs:row.obs||'',
-      contratoOriginal:row.contrato_original||'',
-      historico:Array.isArray(row.historico)?row.historico:[],
-      origem:row.origem||'manual', confianca:row.confianca||null,
-    })));
-    setSelecionados(new Set());
-    setLoading(false);
-  },[]);
-
-  useEffect(()=>{loadPendencias();},[loadPendencias]);
-
-  // Lista de lojas únicas para o filtro manual
-  const lojas = [...new Set(pendencias.map(p=>p.loja).filter(Boolean))].sort();
-
-  // Loja do usuário logado — se definida e não for admin, restringe a visão automaticamente
-  // Array de lojas do editor — null ou vazio = sem restrição (vê tudo)
-  const lojasDoUsuario = (!isAdmin && Array.isArray(perfil?.lojas) && perfil.lojas.length > 0)
-    ? perfil.lojas
-    : null;
-
-  // Limpa todos os filtros
-  function limparFiltros() {
-    setBusca(''); setFStatus(''); setFTipo('');
-    setFLoja(''); setFDataDe(''); setFDataAte('');
-    setSortCol(''); setSortDir('asc');
-  }
-
-  const temFiltroAtivo = busca||fStatus||fTipo||fLoja||fDataDe||fDataAte;
-
-  /* ── Filtragem + Ordenação ── */
-  const filtered = (() => {
-    let lista = pendencias.filter(p=>{
-      // Filtro automático por loja do usuário (editor com loja definida)
-      if(lojasDoUsuario && !lojasDoUsuario.includes(p.loja)) return false;
-      const b = busca.toLowerCase();
-      const bOk = !b||[p.pagador,p.empreendimento,p.proposta,p.loja,p.id].some(x=>(x||'').toLowerCase().includes(b));
-      if(!bOk) return false;
-      if(fStatus && statusEfetivo(p)!==fStatus) return false;
-      if(fTipo && p.tipo!==fTipo) return false;
-      if(fLoja && p.loja!==fLoja) return false;
-      if(fDataDe||fDataAte) {
-        const dt = parseDateBR(p.dataReceb);
-        if(!dt) return false;
-        if(fDataDe) { const de=parseDateBR(fDataDe); if(de&&dt<de) return false; }
-        if(fDataAte) { const ate=parseDateBR(fDataAte); if(ate&&dt>ate) return false; }
-      }
-      return true;
-    });
-
-    if(sortCol) {
-      lista = [...lista].sort((a,b)=>{
-        let va, vb;
-        if(sortCol==='dataReceb') {
-          va = parseDateBR(a.dataReceb)||new Date(0);
-          vb = parseDateBR(b.dataReceb)||new Date(0);
-          return sortDir==='asc' ? va-vb : vb-va;
-        }
-        if(sortCol==='valor') {
-          return sortDir==='asc' ? a.valor-b.valor : b.valor-a.valor;
-        }
-        va = String(a[sortCol]||'').toLowerCase();
-        vb = String(b[sortCol]||'').toLowerCase();
-        return sortDir==='asc' ? va.localeCompare(vb,'pt') : vb.localeCompare(va,'pt');
-      });
-    }
-    return lista;
-  })();
+  const filtered = negs.filter(n=>{
+    const b=busca.toLowerCase();
+    const bOk=!b||[n.clientes?.nome_completo,n.clientes?.empreendimento,n.id,n.clientes?.responsavel_venda].some(x=>(x||'').toLowerCase().includes(b));
+    if(!bOk) return false;
+    if(fStatus && n.status_id!==fStatus) return false;
+    return true;
+  });
 
   const metrics = {
-    total:pendencias.length,
-    pend:pendencias.filter(p=>statusEfetivo(p)==='Pendente').length,
-    and:pendencias.filter(p=>statusEfetivo(p)==='Em andamento').length,
-    atr:pendencias.filter(p=>statusEfetivo(p)==='Atrasada').length,
-    res:pendencias.filter(p=>p.status==='Resolvida').length,
-    val:pendencias.reduce((a,p)=>a+Number(p.valor),0),
-    slaMedia:calcularSlaMedia(pendencias),
+    total: negs.length,
+    porStatus: statusList.map(s=>({ ...s, count: negs.filter(n=>n.status_id===s.id).length })),
+    valorTotal: negs.reduce((a,n)=>a+Number(n.valor_divida||0),0),
   };
 
-  /* ── Seleção múltipla ── */
-  const todosVisivelsSelecionados = filtered.length>0&&filtered.every(p=>selecionados.has(p.id));
-  function toggleSelecionado(id){setSelecionados(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});}
-  function toggleTodos(){
-    if(todosVisivelsSelecionados) setSelecionados(prev=>{const n=new Set(prev);filtered.forEach(p=>n.delete(p.id));return n;});
-    else setSelecionados(prev=>{const n=new Set(prev);filtered.forEach(p=>n.add(p.id));return n;});
-  }
-  async function deletarSelecionados(){
-    const ids=Array.from(selecionados);
-    if(!ids.length||!confirm(`Excluir ${ids.length} pendência(s)?`)) return;
-    setDeletandoLote(true);
-    const {error}=await supabase.from('pendencias').delete().in('id',ids);
-    setDeletandoLote(false);
-    if(error){showToast('Erro: '+error.message);return;}
-    await loadPendencias(); showToast(`${ids.length} pendência(s) excluída(s).`);
-  }
-  async function deletar(id){
-    if(!confirm('Excluir a pendência '+id+'?')) return;
-    const {error}=await supabase.from('pendencias').delete().eq('id',id);
-    if(error){showToast('Erro: '+error.message);return;}
-    await loadPendencias(); showToast('Pendência removida.');
+  // ── Modal ──
+  function openModal(neg=null) {
+    setEditingId(neg?.id||null);
+    if(neg) {
+      setForm({
+        nome_completo: neg.clientes?.nome_completo||'',
+        empreendimento: neg.clientes?.empreendimento||'',
+        responsavel_venda: neg.clientes?.responsavel_venda||'',
+        status_id: neg.status_id||'',
+        situacao: neg.situacao||'',
+        responsavel_cobranca: neg.responsavel_cobranca||'',
+        valor_divida: neg.valor_divida||'',
+        data_vencimento: neg.data_vencimento||'',
+        numero_contrato: neg.numero_contrato||'',
+        obs: neg.obs||'',
+        historico: neg.historico||[],
+        cliente_id: neg.cliente_id,
+      });
+    } else {
+      setForm({ nome_completo:'', empreendimento:'', responsavel_venda:'', status_id: statusList[0]?.id||'', situacao:'', responsavel_cobranca:'', valor_divida:'', data_vencimento:'', numero_contrato:'', obs:'', historico:[] });
+    }
+    setHistNew(''); setParcelas(neg?.parcelas || []);
+    if (neg?.id) carregarAnexos(neg.id); else setAnexos([]);
+    setModalOpen(true);
   }
 
-  /* ── Importação ── */
-  function handleFile(e){
+  async function salvar() {
+    if (!form.nome_completo?.trim()) { showToast('Preencha o nome do cliente.'); return; }
+    setSaving(true);
+    const nomeResp = perfil?.nome||sessao?.user?.email||'Sistema';
+    const dateStr = new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
+    try {
+      if(editingId) {
+        const neg = negs.find(n=>n.id===editingId);
+        const { error: eCli } = await supabase.from('clientes')
+          .update({ nome_completo:form.nome_completo, empreendimento:form.empreendimento, responsavel_venda:form.responsavel_venda })
+          .eq('id',form.cliente_id);
+        if (eCli) throw new Error('Erro ao atualizar cliente: '+eCli.message);
+        const novoHist = [...(neg.historico||[]), histNew ? `${dateStr} - ${histNew} (${nomeResp})` : `${dateStr} - Atualizado por ${nomeResp}`];
+        const { error: eNeg } = await supabase.from('negociacoes')
+          .update({ status_id:form.status_id, responsavel_cobranca:form.responsavel_cobranca, situacao:form.situacao||null, valor_divida:parseFloat(form.valor_divida)||0, data_vencimento:form.data_vencimento, numero_contrato:form.numero_contrato, obs:form.obs, historico:novoHist, parcelas: JSON.parse(JSON.stringify(parcelas)), updated_at:new Date().toISOString() })
+          .eq('id',editingId);
+        if (eNeg) throw new Error('Erro ao atualizar negociação: '+eNeg.message);
+      } else {
+        const { data:cli, error: eCli } = await supabase.from('clientes')
+          .insert({ nome_completo:form.nome_completo, empreendimento:form.empreendimento, responsavel_venda:form.responsavel_venda })
+          .select().single();
+        if (eCli || !cli) throw new Error('Erro ao criar cliente: '+(eCli?.message||'sem retorno'));
+        const newId = nextId(negs);
+        const { error: eNeg } = await supabase.from('negociacoes')
+          .insert({ id:newId, cliente_id:cli.id, status_id:form.status_id||null, responsavel_cobranca:form.responsavel_cobranca, valor_divida:parseFloat(form.valor_divida)||0, data_vencimento:form.data_vencimento, numero_contrato:form.numero_contrato, obs:form.obs, situacao:form.situacao||null, historico:[`${dateStr} - Criado por ${nomeResp}`], parcelas: JSON.parse(JSON.stringify(parcelas)) });
+        if (eNeg) throw new Error('Erro ao criar negociação: '+eNeg.message);
+      }
+      await carregar();
+      setModalOpen(false);
+      showToast('Negociação salva!');
+    } catch(err) {
+      console.error('Erro ao salvar:', err);
+      showToast('Erro: '+err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function excluir(id) {
+    if(!confirm('Excluir negociação '+id+'?')) return;
+    await supabase.from('negociacoes').delete().eq('id',id);
+    await carregar(); showToast('Excluído.');
+  }
+
+  // ── Importação ──
+  function handleFile(e) {
     const file=e.target.files[0]; if(!file) return;
     setFileName(file.name);
-    const isCsv=file.name.toLowerCase().endsWith('.csv');
     const reader=new FileReader();
     reader.onload=(ev)=>{
       const bytes=new Uint8Array(ev.target.result);
-      if(isCsv){
+      if(file.name.toLowerCase().endsWith('.csv')) {
         let texto=new TextDecoder('utf-8').decode(bytes);
-        if(/Ã[£¢§¡©ª«¬­®°±²³´µ¶·¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿƒ]/.test(texto)){
-          texto=new TextDecoder('windows-1252').decode(bytes);
-        }
+        if(/Ã[£¢§¡©ª«¬­®°±]/.test(texto)) texto=new TextDecoder('windows-1252').decode(bytes);
         parseCsvTexto(texto);
       } else {
         const wb=XLSX.read(bytes,{type:'array',raw:true,cellDates:false});
-        processWorkbook(wb);
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const json=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',raw:true});
+        if(!json||json.length<2){alert('Arquivo vazio.');return;}
+        finalizarImport(json[0].map(String), json.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')));
       }
     };
     reader.readAsArrayBuffer(file);
   }
 
-  function parseCsvTexto(texto){
+  function parseCsvTexto(texto) {
     const linhas=[]; let campo='',campos=[],dentroAspas=false;
     for(let i=0;i<texto.length;i++){
       const c=texto[i];
       if(c==='"'){if(dentroAspas&&texto[i+1]==='"'){campo+='"';i++;}else dentroAspas=!dentroAspas;}
       else if(c===','&&!dentroAspas){campos.push(campo);campo='';}
-      else if((c==='\n'||c==='\r')&&!dentroAspas){
-        campos.push(campo);campo='';
-        if(campos.some(f=>f.trim()))linhas.push(campos);
-        campos=[];if(c==='\r'&&texto[i+1]==='\n')i++;
-      } else campo+=c;
+      else if((c==='\n'||c==='\r')&&!dentroAspas){campos.push(campo);campo='';if(campos.some(f=>f.trim()))linhas.push(campos);campos=[];if(c==='\r'&&texto[i+1]==='\n')i++;}
+      else campo+=c;
     }
     if(campo||campos.length){campos.push(campo);if(campos.some(f=>f.trim()))linhas.push(campos);}
     if(linhas.length<2){alert('Arquivo vazio.');return;}
-    finalizarImport(linhas[0].map(String),linhas.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')),linhas.slice(1,6));
+    finalizarImport(linhas[0].map(String), linhas.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')));
   }
 
-  function processWorkbook(wb){
-    const ws=wb.Sheets[wb.SheetNames[0]];
-    const json=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',raw:true});
-    if(!json||json.length<2){alert('Arquivo vazio.');return;}
-    finalizarImport(json[0].map(String),json.slice(1).filter(r=>r.some(c=>String(c).trim()!=='')),json.slice(1,6));
+  function finalizarImport(cols, rows) {
+    setDetectedCols(cols); setImportedRows(rows);
+    const m={}; cols.forEach((col,i)=>{m[i]=guessField(col);}); setMapping(m);
   }
 
-  function finalizarImport(cols,rows,preview){
-    setDetectedCols(cols);setImportedRows(rows);setPreviewRows(preview);
-    const m={};cols.forEach((col,i)=>{m[i]=guessField(col);});setMapping(m);
-  }
-
-  function getMappingByField(){
+  function getMappingByField() {
     const m={};
     Object.entries(mapping).forEach(([idx,field])=>{if(field&&field!=='ignorar')m[field]=parseInt(idx,10);});
     return m;
   }
 
-  function gerarLinhasRevisao(){
+  function gerarLinhasRevisao() {
     const map=getMappingByField();
-    const linhas=importedRows.map((row,i)=>{
-      const cRaw=map.contrato!==undefined?String(row[map.contrato]||''):'';
-      const parsed=parseCamposERP(cRaw);
-      const descRaw=map.descricao!==undefined?String(row[map.descricao]||''):'';
-      const obsPartes=[];
-      if(descRaw) obsPartes.push(descRaw);
-      const obsAuto=extrairObsERP(cRaw);
-      if(obsAuto) obsPartes.push(obsAuto);
-      return {
-        _idx:i, _confianca:parsed.confianca, _original:cRaw,
-        loja:map.ccusto!==undefined?String(row[map.ccusto]||''):'',
-        pagador:map.pagador!==undefined?String(row[map.pagador]||''):parsed.pagador,
-        empreendimento:map.empreendimento!==undefined?String(row[map.empreendimento]||''):parsed.empreendimento,
-        proposta:map.proposta!==undefined?String(row[map.proposta]||''):parsed.proposta,
-        dataReceb:map.data!==undefined?parseData(row[map.data]):'',
-        valor:map.valor!==undefined?parseValor(row[map.valor]):0,
-        obs:obsPartes.filter(Boolean).join(' · '),
-        contratoOriginal:cRaw,
-      };
-    });
-    setLinhasRevisao(linhas);setImportStep(2);
+    setLinhasRevisao(importedRows.map((row,i)=>({
+      _idx:i,
+      nome_completo: map.nome_completo!==undefined ? String(row[map.nome_completo]||'') : '',
+      empreendimento: map.empreendimento!==undefined ? String(row[map.empreendimento]||'') : '',
+      responsavel_venda: map.responsavel_venda!==undefined ? String(row[map.responsavel_venda]||'') : '',
+      situacao: map.situacao!==undefined ? String(row[map.situacao]||'') : '',
+      valor_divida: map.valor_divida!==undefined ? parseValor(row[map.valor_divida]) : 0,
+      data_vencimento: map.data_vencimento!==undefined ? parseData(row[map.data_vencimento]) : '',
+      numero_contrato: map.numero_contrato!==undefined ? String(row[map.numero_contrato]||'') : '',
+      obs: map.obs!==undefined ? String(row[map.obs]||'') : '',
+    })));
+    setImportStep(2);
   }
 
-  function atualizarLinhaRevisao(idx,campo,valor){
-    setLinhasRevisao(prev=>prev.map((l,i)=>i===idx?{...l,[campo]:valor,_confianca:'alta'}:l));
+  function atualizarLinha(idx,campo,valor){
+    setLinhasRevisao(prev=>prev.map((l,i)=>i===idx?{...l,[campo]:valor}:l));
   }
-  function voltarParaMapeamento(){setImportStep(1);setLinhasRevisao([]);}
 
-  async function doImport(){
+  async function doImport() {
     setSaving(true);
     const dateStr=new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
-    const nomeResponsavel=perfil?.nome||sessao?.user?.email||'Sistema';
-    const novas=[]; let seed=[...pendencias];
-    linhasRevisao.forEach(linha=>{
+    const nomeResp=perfil?.nome||sessao?.user?.email||'Sistema';
+    const statusPadrao=statusList[0]?.id||null;
+    let seed=[...negs];
+    for(const linha of linhasRevisao) {
+      if(!linha.nome_completo.trim()) continue;
+      const {data:cli}=await supabase.from('clientes').insert({ nome_completo:linha.nome_completo, empreendimento:linha.empreendimento, responsavel_venda:linha.responsavel_venda }).select().single();
       const newId=nextId(seed);
-      const obsLimpo=(linha.obs||'').replace(/\s*·?\s*Texto original ERP:.+$/i,'').trim();
-      const nova={
-        id:newId, loja:linha.loja||'', pagador:linha.pagador||'',
-        empreendimento:linha.empreendimento||'', proposta:linha.proposta||'',
-        dataReceb:linha.dataReceb||'', valor:parseFloat(String(linha.valor).replace(',','.'))||0,
-        tipo:'Documentação', status:'Pendente', responsavel:'', acao:'A definir',
-        obs:obsLimpo, contratoOriginal:linha.contratoOriginal||'',
-        historico:[`${dateStr} - Importado do ERP por ${nomeResponsavel} (confiança: ${linha._confianca})`],
-        origem:'erp', confianca:linha._confianca,
-      };
-      novas.push(nova); seed=[...seed,nova];
-    });
-    const {error}=await supabase.from('pendencias').insert(novas.map(p=>({
-      id:p.id,loja:p.loja,pagador:p.pagador,empreendimento:p.empreendimento,
-      proposta:p.proposta,data_receb:p.dataReceb,valor:p.valor,tipo:p.tipo,
-      status:p.status,responsavel:p.responsavel,acao:p.acao,obs:p.obs,
-      contrato_original:p.contratoOriginal,historico:p.historico,origem:p.origem,confianca:p.confianca,
-    })));
+      await supabase.from('negociacoes').insert({ id:newId, cliente_id:cli.id, status_id:statusPadrao, situacao:linha.situacao||null, valor_divida:parseFloat(String(linha.valor_divida).replace(',','.'))||0, data_vencimento:linha.data_vencimento, numero_contrato:linha.numero_contrato, obs:linha.obs, historico:[`${dateStr} - Importado por ${nomeResp}`] });
+      seed=[...seed,{id:newId}];
+    }
     setSaving(false);
-    if(error){showToast('Erro ao importar: '+error.message);return;}
-    await loadPendencias();
-    setImportOpen(false);setImportStep(1);
-    setDetectedCols([]);setImportedRows([]);setPreviewRows([]);setFileName('');setLinhasRevisao([]);
+    setImportOpen(false); setImportStep(1);
+    setDetectedCols([]); setImportedRows([]); setFileName(''); setLinhasRevisao([]);
     if(fileInputRef.current) fileInputRef.current.value='';
-    showToast(novas.length+' pendência(s) importada(s) com sucesso!');
+    await carregar();
+    showToast(linhasRevisao.length+' negociação(ões) importada(s)!');
   }
 
   function cancelarImport(){
-    setImportOpen(false);setImportStep(1);
-    setDetectedCols([]);setImportedRows([]);setPreviewRows([]);setFileName('');setLinhasRevisao([]);
+    setImportOpen(false); setImportStep(1);
+    setDetectedCols([]); setImportedRows([]); setFileName(''); setLinhasRevisao([]);
     if(fileInputRef.current) fileInputRef.current.value='';
   }
 
-  /* ── Modal ── */
-  function openModal(id){
-    setEditingId(id);
-    if(id){const p=pendencias.find(x=>x.id===id);setForm({...p});}
-    else setForm({loja:'',status:'Pendente',pagador:'',empreendimento:'',proposta:'',dataReceb:'',valor:'',tipo:'Documentação',responsavel:perfil?.nome||'',acao:'',obs:'',contratoOriginal:'',historico:[]});
-    setHistNew('');setModalOpen(true);
-  }
-  function closeModal(){setModalOpen(false);setEditingId(null);}
-
-  async function savePendencia(){
-    setSaving(true);
-    const nomeResponsavel=perfil?.nome||sessao?.user?.email||'Sistema';
-    const resp=(form.responsavel||'').trim()||nomeResponsavel;
-    const dateStr=new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'});
-    if(editingId){
-      const existing=pendencias.find(p=>p.id===editingId);
-      const novoHist=[...(existing.historico||[])];
-      const mudouParaResolvida=existing.status!=='Resolvida'&&form.status==='Resolvida';
-      if(mudouParaResolvida){
-        novoHist.push(`${dateStr} - Marcado como Resolvida por ${nomeResponsavel}${histNew?' — '+histNew:''}`);
-      } else {
-        novoHist.push(histNew?`${dateStr} - ${histNew} (${nomeResponsavel})`:`${dateStr} - Atualizado por ${nomeResponsavel}`);
-      }
-      const {error}=await supabase.from('pendencias').update({
-        loja:form.loja||'',pagador:form.pagador||'',empreendimento:form.empreendimento||'',
-        proposta:form.proposta||'',data_receb:form.dataReceb||'',valor:parseFloat(form.valor)||0,
-        tipo:form.tipo||'Documentação',status:form.status||'Pendente',responsavel:resp,
-        acao:form.acao||'',obs:form.obs||'',historico:novoHist,
-      }).eq('id',editingId);
-      setSaving(false);
-      if(error){showToast('Erro: '+error.message);return;}
-    } else {
-      const newId=nextId(pendencias);
-      const {error}=await supabase.from('pendencias').insert({
-        id:newId,loja:form.loja||'',pagador:form.pagador||'',empreendimento:form.empreendimento||'',
-        proposta:form.proposta||'',data_receb:form.dataReceb||'',valor:parseFloat(form.valor)||0,
-        tipo:form.tipo||'Documentação',status:form.status||'Pendente',responsavel:resp,
-        acao:form.acao||'',obs:form.obs||'',
-        historico:[`${dateStr} - Criado por ${nomeResponsavel}`],origem:'manual',
-      });
-      setSaving(false);
-      if(error){showToast('Erro: '+error.message);return;}
-    }
-    await loadPendencias();closeModal();showToast('Pendência salva!');
-  }
-
   function exportExcel(){
-    if(!pendencias.length){alert('Nenhuma pendência para exportar.');return;}
-    // Exporta apenas o que está filtrado/ordenado atualmente
-    const rows=filtered.map(p=>({ID:p.id,Origem:p.origem==='erp'?'ERP':'Manual','C.Custo / Loja':p.loja,Pagador:p.pagador,Empreendimento:p.empreendimento,'Proposta / Contrato':p.proposta,'Data Receb.':p.dataReceb,'Valor (R$)':p.valor,Tipo:p.tipo,Status:p.status,Responsável:p.responsavel,'Próxima Ação':p.acao,Observações:p.obs,Histórico:(p.historico||[]).join(' | ')}));
+    if(!negs.length){alert('Nenhuma negociação.');return;}
+    const rows=filtered.map(n=>({'ID':n.id,'Cliente':n.clientes?.nome_completo||'','Empreendimento':n.clientes?.empreendimento||'','Resp. Venda':n.clientes?.responsavel_venda||'','Status':n.status_config?.nome||'','Situação':n.situacao||'','Resp. Cobrança':n.responsavel_cobranca||'','Valor':n.valor_divida||0,'Vencimento':n.data_vencimento||'','Contrato':n.numero_contrato||'','Obs':n.obs||'','Histórico':(n.historico||[]).join(' | ')}));
     const ws=XLSX.utils.json_to_sheet(rows);
-    ws['!cols']=[{wch:10},{wch:8},{wch:30},{wch:26},{wch:24},{wch:16},{wch:12},{wch:14},{wch:14},{wch:14},{wch:20},{wch:32},{wch:42},{wch:60}];
-    const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Pendências');
-    XLSX.writeFile(wb,'Central_Pendencias_MyBroker_'+new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')+'.xlsx');
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Negociações');
+    XLSX.writeFile(wb,'Cobranca_BPO_'+new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')+'.xlsx');
   }
 
-  async function handleLogout(){await supabase.auth.signOut();router.replace('/login');}
+  async function handleLogout(){ await supabase.auth.signOut(); router.replace('/login'); }
 
   return (
     <>
       <Head>
-        <title>Central de Pendências · My Broker CSC Financeiro</title>
-        <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+        <title>Cobrança BPO · Negociações</title>
+        
       </Head>
 
       {/* HEADER */}
-      <div className="header">
-        <div className="logo-area">
-          <div className="logo-mark"><span>MB</span></div>
+      <header className="hdr">
+        <div className="hdr-left">
+          <div className="hdr-logo">⚡</div>
           <div>
-            <div className="header-eyebrow">CSC Financeiro · Contas a Receber</div>
-            <div className="header-name">Central de Pendências</div>
+            <div className="hdr-eyebrow">Plataforma de Cobrança</div>
+            <div className="hdr-title">Negociações<span style={{color:"var(--signal)"}}>.</span></div>
           </div>
         </div>
-        <div className="header-actions">
-          {isAdmin && <button className="chip" onClick={()=>setImportOpen(v=>!v)}>↓ Importar ERP</button>}
-          <button className="chip" onClick={exportExcel}>↑ Exportar Excel</button>
-          {isAdmin && <button className="chip chip-yellow" onClick={()=>openModal(null)}>+ Nova Pendência</button>}
-          <div className="user-pill">
-            <span className="user-nome">{perfil?.nome||sessao?.user?.email}</span>
-            <span className={'user-role '+(isAdmin?'role-admin':'role-editor')}>{isAdmin?'admin':'editor'}</span>
-            {lojasDoUsuario && (
-              <span className="user-loja" title={'Você vê apenas: '+lojasDoUsuario.join(', ')}>
-                🏢 {lojasDoUsuario.length === 1 ? lojasDoUsuario[0] : lojasDoUsuario.length+' lojas'}
-              </span>
-            )}
-            {isAdmin && <button className="user-btn" onClick={()=>router.push('/admin')} title="Gerenciar usuários">⚙</button>}
-            <button className="user-btn" onClick={()=>router.push('/dashboard')} title="Dashboard">📊</button>
-            <button className="user-btn" onClick={handleLogout} title="Sair">⏻</button>
+        <div className="hdr-right">
+          {podeGerenciar && <button className="btn-ghost" onClick={()=>setImportOpen(v=>!v)}>↓ Importar</button>}
+          <button className="btn-ghost" onClick={exportExcel}>↑ Exportar</button>
+          <button className="btn-nova" onClick={()=>openModal()}>+ Nova</button>
+          {podeGerenciar && <button className="btn-ghost" onClick={()=>router.push('/configuracoes')} title="Configurações">⚙</button>}
+          {podeGerenciar && <button className="btn-ghost" onClick={()=>router.push('/situacoes')} title="Situações">📋</button>}
+          {isAdmin && <button className="btn-ghost" onClick={()=>router.push('/admin')} title="Usuários">👥</button>}
+          <button className="btn-ghost" onClick={()=>router.push('/dashboard')} title="Dashboard">📊</button>
+          <div className="user-chip">
+            <span>{perfil?.nome||sessao?.user?.email}</span>
+            <span className={'role-tag role-'+perfil?.role}>{perfil?.role}</span>
+            <button className="logout-btn" onClick={handleLogout} title="Sair">⏻</button>
           </div>
+        </div>
+      </header>
+
+      {/* MÉTRICAS */}
+      <div className="metrics-bar">
+        <div className="metric" onClick={()=>setFStatus('')} style={{cursor:'pointer',outline:fStatus===''?'1px solid var(--accent)':'none'}}>
+          <div className="metric-val">{metrics.total}</div>
+          <div className="metric-lbl">Total</div>
+        </div>
+        {metrics.porStatus.map(s=>(
+          <div key={s.id} className="metric" onClick={()=>setFStatus(fStatus===s.id?'':s.id)} style={{cursor:'pointer',outline:fStatus===s.id?'1px solid '+s.cor:'none',outlineOffset:'-1px'}}>
+            <div className="metric-val" style={{color:s.cor}}>{s.count}</div>
+            <div className="metric-lbl">{s.nome}</div>
+          </div>
+        ))}
+        <div className="metric metric-valor">
+          <div className="metric-val sm">{fmt(metrics.valorTotal)}</div>
+          <div className="metric-lbl">Valor total</div>
         </div>
       </div>
-
-      {erro && <div style={{background:'#FEE2E2',color:'#991B1B',padding:'10px 24px',fontSize:12}}>{erro}</div>}
 
       {/* IMPORT PANEL */}
-      {isAdmin && (
-        <div className={'import-panel'+(importOpen?' open':'')}>
-          {importStep===1 && (<>
-            <div className="import-eyebrow">Importação · Etapa 1 de 2</div>
-            <div className="import-title">Selecionar arquivo e mapear colunas</div>
-            <div className="import-grid">
-              <div className="import-card">
-                <div className="import-card-num">01</div>
-                <div className="import-card-label">Selecionar arquivo</div>
-                <div className="drop-zone">
-                  <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleFile}/>
-                  <div className="drop-icon">📁</div>
-                  <div className="drop-txt">Arraste ou clique para selecionar</div>
-                  <div className="drop-hint">.xlsx · .xls · .csv</div>
+      {podeGerenciar && importOpen && (
+        <div className="import-panel">
+          {importStep===1 && (
+            <>
+              <div className="panel-title">Importar Negociações — Etapa 1: Arquivo e Mapeamento</div>
+              <div className="import-grid">
+                <div className="import-col">
+                  <div className="import-label">01 · Selecionar arquivo</div>
+                  <label className="drop-zone">
+                    <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} style={{display:'none'}}/>
+                    <div className="drop-icon">📁</div>
+                    <div className="drop-txt">Clique para selecionar</div>
+                    <div className="drop-hint">.xlsx · .xls · .csv</div>
+                  </label>
+                  {fileName && <div className="file-ok">✓ {fileName}</div>}
                 </div>
-                {fileName && <div className="file-ok" style={{display:'block'}}>✓ {fileName}</div>}
-              </div>
-              <div className="import-card">
-                <div className="import-card-num">02</div>
-                <div className="import-card-label">Mapeamento de colunas</div>
-                {detectedCols.length===0?<div className="map-empty">Carregue um arquivo para configurar</div>:(
-                  detectedCols.map((col,i)=>(
-                    <div className="map-row" key={i}>
-                      <div className="map-lbl" title={col}>{col}</div>
-                      <div className="map-arr">→</div>
-                      <select className="map-sel" value={mapping[i]||'ignorar'} onChange={e=>setMapping(m=>({...m,[i]:e.target.value}))}>
-                        {CAMPOS_DESTINO.map(f=><option key={f.key} value={f.key}>{f.label}</option>)}
-                      </select>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-            {previewRows.length>0 && (
-              <div className="preview-wrap" style={{display:'block'}}>
-                <div className="preview-eyebrow">Pré-visualização — primeiras 5 linhas brutas</div>
-                <div className="preview-scroll">
-                  <table className="ptbl">
-                    <thead><tr>{detectedCols.map((c,i)=><th key={i}>{c}</th>)}</tr></thead>
-                    <tbody>{previewRows.map((r,ri)=><tr key={ri}>{detectedCols.map((_,ci)=><td key={ci}>{String(r[ci]||'')}</td>)}</tr>)}</tbody>
-                  </table>
+                <div className="import-col">
+                  <div className="import-label">02 · Mapear colunas</div>
+                  {detectedCols.length===0
+                    ? <div className="map-empty">Carregue um arquivo primeiro</div>
+                    : detectedCols.map((col,i)=>(
+                      <div className="map-row" key={i}>
+                        <div className="map-lbl">{col}</div>
+                        <div className="map-arr">→</div>
+                        <select className="map-sel" value={mapping[i]||'ignorar'} onChange={e=>setMapping(m=>({...m,[i]:e.target.value}))}>
+                          {CAMPOS_IMPORT.map(f=><option key={f.key} value={f.key}>{f.label}</option>)}
+                        </select>
+                      </div>
+                    ))
+                  }
                 </div>
               </div>
-            )}
-            <div className="import-footer">
-              <div className="import-info">{importedRows.length>0?`${importedRows.length} linha(s) · ${detectedCols.length} coluna(s)`:''}</div>
-              <div style={{display:'flex',gap:6}}>
-                <button className="chip" onClick={cancelarImport}>Cancelar</button>
-                {importedRows.length>0 && <button className="chip chip-yellow" onClick={gerarLinhasRevisao}>Revisar campos extraídos →</button>}
+              <div className="import-footer">
+                <span className="import-info">{importedRows.length>0?`${importedRows.length} linhas · ${detectedCols.length} colunas`:''}</span>
+                <div style={{display:'flex',gap:8}}>
+                  <button className="btn-ghost" onClick={cancelarImport}>Cancelar</button>
+                  {importedRows.length>0 && <button className="btn-accent" onClick={gerarLinhasRevisao}>Revisar →</button>}
+                </div>
               </div>
-            </div>
-          </>)}
-          {importStep===2 && (<>
-            <div className="import-eyebrow">Importação · Etapa 2 de 2</div>
-            <div className="import-title">Revisar e editar antes de salvar</div>
-            <div className="rev-hint">Campos em <span style={{color:'var(--yellow)'}}>amarelo</span> tiveram extração automática com confiança média ou baixa — revise antes de salvar. Clique em qualquer célula para editar.</div>
-            <div className="rev-wrap">
-              <table className="rev-table">
-                <thead><tr><th>#</th><th>Pagador</th><th>Empreendimento</th><th>Proposta</th><th>Data Receb.</th><th>Valor (R$)</th><th>Texto original ERP</th></tr></thead>
-                <tbody>
-                  {linhasRevisao.map((l,i)=>{
-                    const precisa=l._confianca==='media'||l._confianca==='baixa';
-                    return (
-                      <tr key={i} className={precisa?'rev-row-alerta':''}>
+            </>
+          )}
+
+          {importStep===2 && (
+            <>
+              <div className="panel-title">Importar Negociações — Etapa 2: Revisão</div>
+              <div className="rev-hint">Verifique e edite os campos antes de salvar. Clique em qualquer célula para corrigir.</div>
+              <div className="rev-wrap">
+                <table className="rev-table">
+                  <thead>
+                    <tr><th>#</th><th>Cliente</th><th>Empreendimento</th><th>Situação</th><th>Valor</th><th>Vencimento</th><th>Obs</th></tr>
+                  </thead>
+                  <tbody>
+                    {linhasRevisao.map((l,i)=>(
+                      <tr key={i}>
                         <td className="rev-num">{i+1}</td>
-                        <td><input className={'rev-input'+(precisa&&!l.pagador?' rev-vazio':'')} value={l.pagador||''} onChange={e=>atualizarLinhaRevisao(i,'pagador',e.target.value)} placeholder="— a preencher —"/></td>
-                        <td><input className={'rev-input'+(precisa&&!l.empreendimento?' rev-vazio':'')} value={l.empreendimento||''} onChange={e=>atualizarLinhaRevisao(i,'empreendimento',e.target.value)} placeholder="— a preencher —"/></td>
-                        <td><input className="rev-input" style={{width:90}} value={l.proposta||''} onChange={e=>atualizarLinhaRevisao(i,'proposta',e.target.value)} placeholder="—"/></td>
-                        <td><input className="rev-input" style={{width:100}} value={l.dataReceb||''} onChange={e=>atualizarLinhaRevisao(i,'dataReceb',e.target.value)} placeholder="DD/MM/AAAA"/></td>
-                        <td><input className="rev-input" style={{width:110}} value={l.valor||''} onChange={e=>atualizarLinhaRevisao(i,'valor',e.target.value)} placeholder="0,00"/></td>
-                        <td><div className="rev-original" title={l._original}>{l._original||'—'}</div></td>
+                        <td><input className={'rev-input'+(l.nome_completo?'':' rev-vazio')} value={l.nome_completo} onChange={e=>atualizarLinha(i,'nome_completo',e.target.value)} placeholder="— obrigatório —"/></td>
+                        <td><input className="rev-input" value={l.empreendimento} onChange={e=>atualizarLinha(i,'empreendimento',e.target.value)} placeholder="—"/></td>
+                        <td><input className="rev-input" style={{width:140}} value={l.situacao} onChange={e=>atualizarLinha(i,'situacao',e.target.value)} placeholder="—"/></td>
+                        <td><input className="rev-input" style={{width:110}} value={l.valor_divida} onChange={e=>atualizarLinha(i,'valor_divida',e.target.value)} placeholder="0,00"/></td>
+                        <td><input className="rev-input" style={{width:110}} value={l.data_vencimento} onChange={e=>atualizarLinha(i,'data_vencimento',e.target.value)} placeholder="DD/MM/AAAA"/></td>
+                        <td><input className="rev-input" style={{width:140}} value={l.obs} onChange={e=>atualizarLinha(i,'obs',e.target.value)} placeholder="—"/></td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <div className="import-footer">
-              <div className="import-info">{linhasRevisao.filter(l=>l._confianca==='media'||l._confianca==='baixa').length} linha(s) precisam de revisão · {linhasRevisao.length} total</div>
-              <div style={{display:'flex',gap:6}}>
-                <button className="chip" onClick={cancelarImport}>Cancelar</button>
-                <button className="chip" onClick={voltarParaMapeamento}>← Voltar</button>
-                <button className="chip chip-yellow" onClick={doImport} disabled={saving}>{saving?'Salvando...':'✓ Confirmar e salvar'}</button>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-            </div>
-          </>)}
+              <div className="import-footer">
+                <span className="import-info">{linhasRevisao.length} negociação(ões) para importar</span>
+                <div style={{display:'flex',gap:8}}>
+                  <button className="btn-ghost" onClick={cancelarImport}>Cancelar</button>
+                  <button className="btn-ghost" onClick={()=>setImportStep(1)}>← Voltar</button>
+                  <button className="btn-accent" onClick={doImport} disabled={saving}>{saving?'Salvando...':'✓ Confirmar e salvar'}</button>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       )}
 
-      {/* METRICS */}
-      <div className="metrics-section">
-        <div className="metrics-eyebrow">Visão geral · clique em um status para filtrar</div>
-        <div className="metrics">
-          <div className={'metric total clickable'+(fStatus===''?' active':'')} onClick={()=>setFStatus('')} title="Mostrar todos">
-            <div className="metric-num">∑</div><div className="metric-lbl">Total</div><div className="metric-val">{metrics.total}</div>
-          </div>
-          <div className={'metric pend clickable'+(fStatus==='Pendente'?' active':'')} onClick={()=>setFStatus(fStatus==='Pendente'?'':'Pendente')}>
-            <div className="metric-num">P</div><div className="metric-lbl">Pendentes</div><div className="metric-val yellow">{metrics.pend}</div>
-          </div>
-          <div className={'metric and clickable'+(fStatus==='Em andamento'?' active':'')} onClick={()=>setFStatus(fStatus==='Em andamento'?'':'Em andamento')}>
-            <div className="metric-num">A</div><div className="metric-lbl">Em andamento</div><div className="metric-val">{metrics.and}</div>
-          </div>
-          <div className={'metric atr clickable'+(fStatus==='Atrasada'?' active':'')} onClick={()=>setFStatus(fStatus==='Atrasada'?'':'Atrasada')}>
-            <div className="metric-num">!</div><div className="metric-lbl">Atrasadas</div><div className="metric-val danger">{metrics.atr}</div>
-          </div>
-          <div className={'metric res clickable'+(fStatus==='Resolvida'?' active':'')} onClick={()=>setFStatus(fStatus==='Resolvida'?'':'Resolvida')}>
-            <div className="metric-num">✓</div><div className="metric-lbl">Resolvidas</div><div className="metric-val green">{metrics.res}</div>
-          </div>
-          <div className="metric sla">
-            <div className="metric-num">⏱</div><div className="metric-lbl">SLA Médio</div><div className="metric-val sm">{metrics.slaMedia!==null?metrics.slaMedia+' dias':'—'}</div>
-          </div>
-          <div className="metric val">
-            <div className="metric-num">R$</div><div className="metric-lbl">Valor Total</div><div className="metric-val sm">{fmt(metrics.val)}</div>
-          </div>
-        </div>
-      </div>
-      <div className="sla-hint">SLA padrão: {SLA_PADRAO_DIAS} dia útil para retorno · Atrasada = sem movimentação dentro do prazo · SLA Médio = tempo real até resolução</div>
-
-      {/* TOOLBAR DE FILTROS */}
+      {/* TOOLBAR */}
       <div className="toolbar">
-        <input className="fld" type="text" placeholder="🔍 Buscar pagador, empreendimento, proposta, ID..." value={busca} onChange={e=>setBusca(e.target.value)} style={{minWidth:260}}/>
-        <button className={'chip'+(filtrosAbertos?' chip-ativo':'')} onClick={()=>setFiltrosAbertos(v=>!v)} title="Filtros avançados">
-          ⚙ Filtros{temFiltroAtivo?' ●':''}
-        </button>
-        {temFiltroAtivo && <button className="chip chip-limpar" onClick={limparFiltros} title="Limpar todos os filtros">✕ Limpar</button>}
-        {loading && <span style={{color:'rgba(255,255,255,.5)',fontSize:11,fontFamily:"'DM Mono',monospace"}}>carregando…</span>}
-        <span style={{marginLeft:'auto',fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,color:'rgba(255,255,255,.4)'}}>
-          {filtered.length} resultado{filtered.length!==1?'s':''} de {pendencias.length}
-        </span>
+        <input className="search-input" type="text" placeholder="🔍 Buscar cliente, empreendimento, ID..." value={busca} onChange={e=>setBusca(e.target.value)}/>
+        <button className={'btn-ghost'+(filtrosAbertos?' active':'')} onClick={()=>setFiltrosAbertos(v=>!v)}>⚙ Filtros</button>
+        {(busca||fStatus||fDataDe||fDataAte) && <button className="btn-clear" onClick={()=>{setBusca('');setFStatus('');setFDataDe('');setFDataAte('');}}>✕ Limpar</button>}
+        {loading && <span className="loading-txt">carregando...</span>}
+        <span className="result-count">{filtered.length} de {negs.length}</span>
       </div>
 
-      {/* PAINEL DE FILTROS AVANÇADOS */}
       {filtrosAbertos && (
-        <div className="filtros-panel">
-          <div className="filtros-grid">
-            <div className="filtro-grupo">
-              <label className="filtro-label">Status</label>
-              <select className="filtro-sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
-                <option value="">Todos</option>
-                <option>Pendente</option><option>Em andamento</option><option>Atrasada</option><option>Resolvida</option>
-              </select>
-            </div>
-            <div className="filtro-grupo">
-              <label className="filtro-label">Tipo</label>
-              <select className="filtro-sel" value={fTipo} onChange={e=>setFTipo(e.target.value)}>
-                <option value="">Todos</option>
-                <option>Documentação</option><option>Pagamento</option><option>Assinatura</option><option>Vistoria</option><option>Outro</option>
-              </select>
-            </div>
-            {!lojasDoUsuario && (
-              <div className="filtro-grupo">
-                <label className="filtro-label">Loja / C.Custo</label>
-                <select className="filtro-sel" value={fLoja} onChange={e=>setFLoja(e.target.value)}>
-                  <option value="">Todas as lojas</option>
-                  {lojas.map(l=><option key={l} value={l}>{l}</option>)}
-                </select>
-              </div>
-            )}
-            <div className="filtro-grupo">
-              <label className="filtro-label">Data Receb. — De</label>
-              <input className="filtro-sel" type="text" placeholder="DD/MM/AAAA" value={fDataDe} onChange={e=>setFDataDe(e.target.value)}/>
-            </div>
-            <div className="filtro-grupo">
-              <label className="filtro-label">Data Receb. — Até</label>
-              <input className="filtro-sel" type="text" placeholder="DD/MM/AAAA" value={fDataAte} onChange={e=>setFDataAte(e.target.value)}/>
-            </div>
-            <div className="filtro-grupo">
-              <label className="filtro-label">Ordenar por</label>
-              <select className="filtro-sel" value={sortCol} onChange={e=>setSortCol(e.target.value)}>
-                <option value="">Padrão (ID)</option>
-                <option value="dataReceb">Data Receb.</option>
-                <option value="valor">Valor</option>
-                <option value="pagador">Pagador</option>
-                <option value="loja">Loja</option>
-                <option value="status">Status</option>
-              </select>
-            </div>
-            <div className="filtro-grupo">
-              <label className="filtro-label">Direção</label>
-              <select className="filtro-sel" value={sortDir} onChange={e=>setSortDir(e.target.value)}>
-                <option value="asc">Crescente ↑</option>
-                <option value="desc">Decrescente ↓</option>
-              </select>
-            </div>
+        <div className="filter-panel">
+          <div className="filter-group">
+            <label>Status</label>
+            <select value={fStatus} onChange={e=>setFStatus(e.target.value)}>
+              <option value="">Todos</option>
+              {statusList.map(s=><option key={s.id} value={s.id}>{s.nome}</option>)}
+            </select>
+          </div>
+          <div className="filter-group">
+            <label>Vencimento — De</label>
+            <input type="text" placeholder="DD/MM/AAAA" value={fDataDe} onChange={e=>setFDataDe(e.target.value)}/>
+          </div>
+          <div className="filter-group">
+            <label>Vencimento — Até</label>
+            <input type="text" placeholder="DD/MM/AAAA" value={fDataAte} onChange={e=>setFDataAte(e.target.value)}/>
           </div>
         </div>
       )}
 
-      {/* BULK ACTION BAR */}
-      {isAdmin && selecionados.size>0 && (
-        <div className="bulk-bar">
-          <div className="bulk-info">
-            <div className="bulk-count">{selecionados.size}</div>
-            <span>selecionada{selecionados.size>1?'s':''}</span>
-          </div>
-          <div style={{display:'flex',gap:8}}>
-            <button className="chip" onClick={()=>setSelecionados(new Set())}>Cancelar</button>
-            <button className="chip chip-danger" onClick={deletarSelecionados} disabled={deletandoLote}>{deletandoLote?'Excluindo...':'🗑 Excluir '+selecionados.size}</button>
-          </div>
-        </div>
-      )}
-
-      {/* TABLE */}
-      <div className="tbl-section">
-        <div className="tbl-wrap">
-          <table>
-            <thead>
-              <tr>
-                {isAdmin && <th style={{width:40,textAlign:'center'}}><input type="checkbox" className="cb" checked={todosVisivelsSelecionados} onChange={toggleTodos}/></th>}
-                <th onClick={()=>toggleSort('id')} className="th-sort">ID<SortIcon col="id"/></th>
-                <th onClick={()=>toggleSort('loja')} className="th-sort">C.Custo / Loja<SortIcon col="loja"/></th>
-                <th onClick={()=>toggleSort('pagador')} className="th-sort">Pagador<SortIcon col="pagador"/></th>
-                <th onClick={()=>toggleSort('empreendimento')} className="th-sort">Empreendimento<SortIcon col="empreendimento"/></th>
-                <th>Proposta</th>
-                <th onClick={()=>toggleSort('dataReceb')} className="th-sort">Data Receb.<SortIcon col="dataReceb"/></th>
-                <th onClick={()=>toggleSort('valor')} className="th-sort">Valor<SortIcon col="valor"/></th>
-                <th onClick={()=>toggleSort('status')} className="th-sort">Status<SortIcon col="status"/></th>
-                <th onClick={()=>toggleSort('responsavel')} className="th-sort">Responsável<SortIcon col="responsavel"/></th>
-                <th>Próxima Ação</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.length===0 ? (
-                <tr className="empty-row">
-                  <td colSpan={isAdmin?13:12}>
-                    {loading?'Carregando...':pendencias.length===0?'Nenhuma pendência cadastrada':'Nenhum resultado para os filtros selecionados'}
+      {/* TABELA */}
+      <div className="tbl-wrap">
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>ID</th><th>Cliente</th><th>Empreendimento</th>
+              <th>Resp. Venda</th><th>Vencimento</th><th>Valor</th>
+              <th>Status</th><th>Situação</th><th>Resp. Cobrança</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length===0 ? (
+              <tr><td colSpan={9} className="empty-row">{loading?'Carregando...':'Nenhuma negociação encontrada'}</td></tr>
+            ) : filtered.map(n=>{
+              const st = n.status_config;
+              return (
+                <tr key={n.id} className="tbl-row">
+                  <td className="id-cell">{n.id}</td>
+                  <td className="cell-primary">{n.clientes?.nome_completo||'—'}</td>
+                  <td className="cell-sec">{n.clientes?.empreendimento||'—'}</td>
+                  <td className="cell-sec">{n.clientes?.responsavel_venda||'—'}</td>
+                  <td className="cell-mono">{n.data_vencimento||'—'}</td>
+                  <td className="cell-mono">{fmt(n.valor_divida)}</td>
+                  <td>
+                    {st ? (
+                      <span className="status-pill" style={{background:st.cor+'22',color:st.cor,borderColor:st.cor+'44'}}>
+                        {st.nome}
+                      </span>
+                    ) : '—'}
+                  </td>
+                  <td className="cell-sec">{n.situacao||<span className="cell-empty">—</span>}</td>
+                  <td className="cell-sec">{n.responsavel_cobranca||<span className="cell-empty">a definir</span>}</td>
+                  <td className="cell-actions">
+                    <button className="act-btn" onClick={()=>openModal(n)}>editar</button>
+                    {isAdmin && <button className="act-btn danger" onClick={()=>excluir(n.id)}>excluir</button>}
                   </td>
                 </tr>
-              ) : filtered.map(p=>{
-                const statusReal=statusEfetivo(p);
-                const b=badge(statusReal);
-                const sel=selecionados.has(p.id);
-                const diasParado=p.status!=='Resolvida'?diasDesdeUltimaMovimentacao(p):null;
-                const estourouSla=diasParado!==null&&diasParado>SLA_PADRAO_DIAS;
-                return (
-                  <tr key={p.id} className={(sel?'row-selected ':'')+(estourouSla?'row-atrasada':'')} onClick={isAdmin?()=>toggleSelecionado(p.id):undefined} style={isAdmin?{cursor:'pointer'}:{}}>
-                    {isAdmin && <td style={{textAlign:'center'}} onClick={e=>e.stopPropagation()}><input type="checkbox" className="cb" checked={sel} onChange={()=>toggleSelecionado(p.id)}/></td>}
-                    <td className="id-cell" onClick={e=>e.stopPropagation()}>
-                      {p.id}
-                      {p.origem==='erp'&&<span className="tag-erp">ERP</span>}
-                      {p.confianca&&p.confianca!=='alta'&&<span className={'tag-conf '+p.confianca}>{p.confianca}</span>}
-                    </td>
-                    <td><div className="ellipsis" title={p.loja} style={{maxWidth:110,fontSize:10,color:'var(--muted)'}}>{p.loja||'—'}</div></td>
-                    <td><div className="pagador-cell ellipsis" title={p.pagador}>{p.pagador||'—'}</div></td>
-                    <td><div className="emp-cell ellipsis" title={p.empreendimento}>{p.empreendimento||'—'}</div></td>
-                    <td className="prop-cell">{p.proposta||'—'}</td>
-                    <td className="date-cell">{p.dataReceb||'—'}</td>
-                    <td className="val-cell">{fmt(p.valor)}</td>
-                    <td><span className={'badge '+b.cls}>{b.label}</span></td>
-                    <td style={{fontSize:11}}>{p.responsavel||<span style={{color:'var(--muted)',fontStyle:'italic'}}>a definir</span>}</td>
-                    <td style={{fontSize:11,color:'var(--text2)'}}><div className="ellipsis" style={{maxWidth:140}} title={p.acao}>{p.acao||'—'}</div></td>
-                    <td style={{whiteSpace:'nowrap',display:'flex',gap:3,paddingTop:8}} onClick={e=>e.stopPropagation()}>
-                      <button className="row-btn" onClick={()=>openModal(p.id)}>editar</button>
-                      {isAdmin && <button className="row-btn del" onClick={()=>deletar(p.id)}>excluir</button>}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
 
       {/* MODAL */}
-      <div className={'overlay'+(modalOpen?' open':'')}>
-        <div className="modal">
-          <div className="modal-head">
-            <div>
-              <div className="modal-eyebrow">CSC Financeiro · Contas a Receber</div>
-              <div className="modal-head-title">{editingId?`Editar Pendência — ${editingId}`:'Nova Pendência'}</div>
-            </div>
-            <button className="modal-close" onClick={closeModal}>✕</button>
-          </div>
-          <div className="modal-body">
-            <div className="form-grid">
-              <div className="fg"><label>C.Custo / Loja</label><input type="text" placeholder="Ex: RECEITA COMERCIAL LANÇAMENTO" value={form.loja||''} onChange={e=>setForm(f=>({...f,loja:e.target.value}))}/></div>
-              <div className="fg"><label>Status</label><select value={form.status||'Pendente'} onChange={e=>setForm(f=>({...f,status:e.target.value}))}><option>Pendente</option><option>Em andamento</option><option>Atrasada</option><option>Resolvida</option></select></div>
-              <div className="fg"><label>Pagador</label><input type="text" placeholder="Nome completo do pagador" value={form.pagador||''} onChange={e=>setForm(f=>({...f,pagador:e.target.value}))}/></div>
-              <div className="fg"><label>Empreendimento</label><input type="text" placeholder="Ex: Lottus Residence..." value={form.empreendimento||''} onChange={e=>setForm(f=>({...f,empreendimento:e.target.value}))}/></div>
-              <div className="fg"><label>Proposta / Contrato</label><input type="text" placeholder="Nº da proposta" value={form.proposta||''} onChange={e=>setForm(f=>({...f,proposta:e.target.value}))}/></div>
-              <div className="fg"><label>Data Receb.</label><input type="text" placeholder="DD/MM/AAAA" value={form.dataReceb||''} onChange={e=>setForm(f=>({...f,dataReceb:e.target.value}))}/></div>
-              <div className="fg"><label>Valor (R$)</label><input type="number" placeholder="0,00" min="0" step="0.01" value={form.valor??''} onChange={e=>setForm(f=>({...f,valor:e.target.value}))}/></div>
-              <div className="fg"><label>Tipo</label><select value={form.tipo||'Documentação'} onChange={e=>setForm(f=>({...f,tipo:e.target.value}))}><option>Documentação</option><option>Pagamento</option><option>Assinatura</option><option>Vistoria</option><option>Outro</option></select></div>
-              <div className="fg"><label>Responsável Atual</label><input type="text" placeholder="Nome do responsável" value={form.responsavel||''} onChange={e=>setForm(f=>({...f,responsavel:e.target.value}))}/></div>
-              <div className="fg full"><label>Próxima Ação</label><input type="text" placeholder="Descreva a próxima ação" value={form.acao||''} onChange={e=>setForm(f=>({...f,acao:e.target.value}))}/></div>
-              <div className="fg full">
-                <label>Observações</label>
-                <textarea placeholder="Digite tratativas, contatos realizados, informações relevantes..." value={form.obs||''} onChange={e=>setForm(f=>({...f,obs:e.target.value}))}/>
+      {modalOpen && (
+        <div className="overlay" onClick={e=>{if(e.target===e.currentTarget)setModalOpen(false)}}>
+          <div className="modal">
+            <div className="modal-hdr">
+              <div>
+                <div className="modal-eyebrow">Cobrança BPO · Negociação</div>
+                <div className="modal-title">{editingId?`Editar — ${editingId}`:'Nova Negociação'}</div>
               </div>
-              {form.contratoOriginal && (
-                <div className="fg full">
-                  <label style={{display:'flex',alignItems:'center',gap:6}}>
-                    Texto original do ERP
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,background:'rgba(138,150,176,.15)',color:'var(--muted)',padding:'1px 6px'}}>somente leitura</span>
-                  </label>
-                  <div className="erp-original-box">{form.contratoOriginal}</div>
+              <button className="modal-close" onClick={()=>setModalOpen(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div className="modal-section">Dados do Cliente</div>
+              <div className="form-grid">
+                <div className="fg"><label>Nome completo *</label><input type="text" value={form.nome_completo||''} onChange={e=>setForm(f=>({...f,nome_completo:e.target.value}))} placeholder="Nome do cliente"/></div>
+                <div className="fg"><label>Empreendimento</label><input type="text" value={form.empreendimento||''} onChange={e=>setForm(f=>({...f,empreendimento:e.target.value}))} placeholder="Nome do empreendimento"/></div>
+                <div className="fg full"><label>Responsável pela venda</label><input type="text" value={form.responsavel_venda||''} onChange={e=>setForm(f=>({...f,responsavel_venda:e.target.value}))} placeholder="Nome do responsável pela venda"/></div>
+              </div>
+              <div className="modal-section" style={{marginTop:16}}>Dados da Negociação</div>
+              <div className="form-grid">
+                <div className="fg"><label>Status</label>
+                  {perfil?.role === 'operador' ? (
+                    // Operador: só pode avançar para o próximo status configurado
+                    <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                      <div className="status-atual-pill" style={{
+                        background: (statusList.find(s=>s.id===form.status_id)?.cor||'#8A96B0')+'22',
+                        color: statusList.find(s=>s.id===form.status_id)?.cor||'#8A96B0',
+                        border: `1px solid ${statusList.find(s=>s.id===form.status_id)?.cor||'#8A96B0'}44`,
+                        padding:'6px 12px', fontFamily:'var(--font-mono)', fontSize:10, letterSpacing:2, textTransform:'uppercase', fontWeight:700,
+                      }}>
+                        {statusList.find(s=>s.id===form.status_id)?.nome || 'Sem status'}
+                      </div>
+                      {(() => {
+                        const stAtual = statusList.find(s=>s.id===form.status_id);
+                        const proxId = stAtual?.proximo_status_id;
+                        const proxStatus = proxId ? statusList.find(s=>s.id===proxId) : null;
+                        if (proxStatus && stAtual?.permite_avanco_manual !== false) return (
+                          <button type="button" className="btn-avancar"
+                            onClick={()=>setForm(f=>({...f,status_id:proxStatus.id}))}
+                            style={{borderColor:proxStatus.cor,color:proxStatus.cor}}>
+                            Avançar para: {proxStatus.nome} →
+                          </button>
+                        );
+                        if (!proxStatus) return <div style={{fontSize:10,color:'#8A90A8',fontStyle:'italic'}}>Último status do fluxo</div>;
+                        return <div style={{fontSize:10,color:'#8A90A8',fontStyle:'italic'}}>🔒 Avanço automático apenas</div>;
+                      })()}
+                    </div>
+                  ) : (
+                    // Gestor/Admin: vê todos os status
+                    <select value={form.status_id||''} onChange={e=>setForm(f=>({...f,status_id:e.target.value}))}>
+                      {statusList.map(s=><option key={s.id} value={s.id}>{s.nome}</option>)}
+                    </select>
+                  )}
+                </div>
+                <div className="fg"><label>Situação</label><select value={form.situacao||''} onChange={e=>setForm(f=>({...f,situacao:e.target.value}))}><option value="">— Selecione —</option>
+                              <option value="Acordo em negociação">Acordo em negociação</option>
+                              <option value="Acordo Formalizado">Acordo Formalizado</option>
+                              <option value="Descumprimento de Acordo">Descumprimento de Acordo</option>
+                              <option value="Em Judicialização">Em Judicialização</option>
+                              <option value="Enviado Jurídico">Enviado Jurídico</option>
+                              <option value="Judicializado">Judicializado</option>
+                              <option value="Perdido">Perdido</option>
+                              <option value="Protestar">Protestar</option></select></div>
+                <div className="fg"><label>Responsável pela cobrança</label><input type="text" value={form.responsavel_cobranca||''} onChange={e=>setForm(f=>({...f,responsavel_cobranca:e.target.value}))} placeholder="Quem está acompanhando"/></div>
+                <div className="fg"><label>Valor da dívida (R$)</label><input type="number" min="0" step="0.01" value={form.valor_divida||''} onChange={e=>setForm(f=>({...f,valor_divida:e.target.value}))} placeholder="0,00"/></div>
+                <div className="fg"><label>Data de vencimento</label><input type="text" value={form.data_vencimento||''} onChange={e=>setForm(f=>({...f,data_vencimento:e.target.value}))} placeholder="DD/MM/AAAA"/></div>
+                <div className="fg"><label>Número do contrato</label><input type="text" value={form.numero_contrato||''} onChange={e=>setForm(f=>({...f,numero_contrato:e.target.value}))} placeholder="Nº do contrato"/></div>
+                <div className="fg full"><label>Observações</label><textarea value={form.obs||''} onChange={e=>setForm(f=>({...f,obs:e.target.value}))} placeholder="Tratativas, contatos realizados..."/></div>
+              </div>
+
+              {/* ── PARCELAS ── */}
+              <div className="modal-section" style={{marginTop:16}}>Parcelas</div>
+              <div className="parcelas-toolbar">
+                <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                  <input
+                    className="parcela-input-qtd"
+                    type="number" min="1" max="360"
+                    placeholder="Qtd de parcelas"
+                    value={form.parcelas_qtd||''}
+                    onChange={e=>setForm(f=>({...f,parcelas_qtd:e.target.value}))}
+                  />
+                  <button className="btn-parcela-gerar" onClick={gerarParcelasAuto} type="button">
+                    ⚡ Gerar automaticamente
+                  </button>
+                  <span className="parcela-hint">ou</span>
+                  <button className="btn-parcela-add" onClick={addParcela} type="button">
+                    + Adicionar parcela manualmente
+                  </button>
+                </div>
+                {parcelas.length > 0 && (
+                  <div className="parcelas-resumo">
+                    {parcelas.length} parcela(s) · {' '}
+                    Pagas: {parcelas.filter(p=>p.status==='pago').length} · {' '}
+                    Pendentes: {parcelas.filter(p=>p.status==='pendente').length} · {' '}
+                    Total: R$ {parcelas.reduce((a,p)=>a+parseFloat(String(p.valor||0).replace(',','.'))||0,0).toLocaleString('pt-BR',{minimumFractionDigits:2})}
+                  </div>
+                )}
+              </div>
+              {parcelas.length > 0 && (
+                <div className="parcelas-wrap">
+                  <table className="parcelas-table">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Vencimento</th>
+                        <th>Valor (R$)</th>
+                        <th>Status</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {parcelas.map((p, i) => (
+                        <tr key={p.id} className={'parcela-row '+(p.status==='pago'?'parcela-pago':'')}>
+                          <td className="parcela-num">{i+1}</td>
+                          <td>
+                            <input
+                              className="parcela-field"
+                              type="text"
+                              placeholder="DD/MM/AAAA"
+                              value={p.data}
+                              onChange={e=>updateParcela(p.id,'data',e.target.value)}
+                            />
+                          </td>
+                          <td>
+                            <input
+                              className="parcela-field"
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              placeholder="0,00"
+                              value={p.valor}
+                              onChange={e=>updateParcela(p.id,'valor',e.target.value)}
+                            />
+                          </td>
+                          <td>
+                            <select
+                              className={'parcela-status '+(p.status==='pago'?'status-pago':'status-pendente')}
+                              value={p.status}
+                              onChange={e=>updateParcela(p.id,'status',e.target.value)}
+                            >
+                              <option value="pendente">Pendente</option>
+                              <option value="pago">Pago</option>
+                              <option value="atrasado">Atrasado</option>
+                              <option value="cancelado">Cancelado</option>
+                            </select>
+                          </td>
+                          <td>
+                            <button className="parcela-del" onClick={()=>removeParcela(p.id)} type="button" title="Remover">✕</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
-              {editingId && (()=>{
-                const pAtual=pendencias.find(x=>x.id===editingId);
-                const diasParado=pAtual&&pAtual.status!=='Resolvida'?diasDesdeUltimaMovimentacao(pAtual):null;
-                const estourou=diasParado!==null&&diasParado>SLA_PADRAO_DIAS;
-                return (
-                  <>
-                    {diasParado!==null && (
-                      <div className="fg full">
-                        <div className={'sla-modal-box'+(estourou?' sla-estourado':'')}>
-                          <div className="sla-modal-label">SLA de resposta</div>
-                          <div className="sla-modal-valor">
-                            {diasParado===0&&'Movimentado hoje — dentro do prazo'}
-                            {diasParado===1&&!estourou&&'1 dia sem nova movimentação — dentro do prazo'}
-                            {diasParado>1&&!estourou&&`${diasParado} dias sem nova movimentação — dentro do prazo`}
-                            {estourou&&`⚠ ${diasParado} dia${diasParado>1?'s':''} sem retorno — SLA estourado (prazo: ${SLA_PADRAO_DIAS} dia${SLA_PADRAO_DIAS>1?'s':''})`}
+              {parcelas.length === 0 && (
+                <div className="parcelas-empty">Nenhuma parcela cadastrada. Use os botões acima para adicionar.</div>
+              )}
+              {editingId && (
+                <>
+                  <div className="modal-section" style={{marginTop:16}}>Histórico</div>
+                  <ul className="hist-list">
+                    {(form.historico||[]).map((h,i)=><li key={i} className="hist-item">{h}</li>)}
+                  </ul>
+                  <input className="hist-input" type="text" placeholder="Adicionar registro ao histórico..." value={histNew} onChange={e=>setHistNew(e.target.value)}/>
+                </>
+              )}
+
+              {/* ── ANEXOS ── */}
+              {editingId && (
+                <>
+                  <div className="modal-section" style={{marginTop:16}}>Anexos</div>
+                  <div className="anexos-toolbar">
+                    <label className="btn-anexar">
+                      <input ref={anexoInputRef} type="file" accept=".pdf,image/*" onChange={uploadAnexo} style={{display:'none'}} disabled={uploadingAnexo}/>
+                      {uploadingAnexo ? '⏳ Enviando...' : '📎 Adicionar arquivo'}
+                    </label>
+                    <span className="anexo-hint">PDF ou imagem · máx 10MB</span>
+                  </div>
+                  {anexos.length === 0
+                    ? <div className="anexos-empty">Nenhum arquivo anexado ainda.</div>
+                    : <div className="anexos-list">
+                        {anexos.map(a=>(
+                          <div key={a.id} className="anexo-row">
+                            <span className="anexo-icon">{a.tipo==='pdf'?'📄':'🖼'}</span>
+                            <div className="anexo-info">
+                              <div className="anexo-nome">{a.nome_arquivo}</div>
+                              <div className="anexo-meta">{fmtTamanho(a.tamanho)} · {a.enviado_por_nome} · {new Date(a.created_at).toLocaleDateString('pt-BR')}</div>
+                            </div>
+                            <div className="anexo-actions">
+                              <button className="act-btn" onClick={()=>abrirAnexo(a.storage_path)}>abrir</button>
+                              {(perfil?.role==='admin'||perfil?.role==='gestor') && (
+                                <button className="act-btn danger" onClick={()=>excluirAnexo(a.id,a.storage_path)}>remover</button>
+                              )}
+                            </div>
                           </div>
-                          <div className="sla-modal-hint">Prazo padrão: {SLA_PADRAO_DIAS} dia útil · Adicione uma tratativa no histórico para reiniciar o contador</div>
-                        </div>
+                        ))}
                       </div>
-                    )}
-                    <div className="section-divider">Histórico de tratativas</div>
-                    <div className="fg full">
-                      <ul className="hist-list">{(form.historico||[]).map((h,i)=><li className="hist-item" key={i}>{h}</li>)}</ul>
-                      <input className="hist-input" type="text" placeholder="Adicionar registro ao histórico..." value={histNew} onChange={e=>setHistNew(e.target.value)}/>
-                    </div>
-                  </>
-                );
-              })()}
+                  }
+                </>
+              )}
+            </div>
+            <div className="modal-foot">
+              <button className="btn-ghost" onClick={()=>setModalOpen(false)}>Cancelar</button>
+              <button className="btn-accent" onClick={salvar} disabled={saving}>{saving?'Salvando...':'Salvar'}</button>
             </div>
           </div>
-          <div className="modal-foot">
-            <button className="btn btn-outline" onClick={closeModal}>Cancelar</button>
-            <button className="btn btn-primary" onClick={savePendencia} disabled={saving}>{saving?'Salvando...':'Salvar Pendência'}</button>
-          </div>
         </div>
-      </div>
+      )}
 
-      {/* TOAST */}
-      <div className={'toast'+(toast?' show':'')}><div className="toast-icon"/><span>{toast}</span></div>
-
-      {/* FOOTER */}
-      <div className="footer-bar">
-        <div className="footer-info">My Broker Imóveis · CSC Financeiro · Central de Pendências</div>
-        <div className="footer-actions">
-          {isAdmin && <button className="footer-btn" onClick={()=>setImportOpen(v=>!v)}>↓ importar erp</button>}
-          <button className="footer-btn" onClick={()=>router.push('/dashboard')}>📊 dashboard</button>
-          <button className="footer-btn" onClick={exportExcel}>↑ exportar xlsx</button>
-          {isAdmin && <button className="footer-btn" onClick={()=>openModal(null)}>+ nova pendência</button>}
-          <button className="footer-btn" onClick={handleLogout}>⏻ sair</button>
-        </div>
-      </div>
+      <div className={'toast'+(toast?' show':'')}>{toast}</div>
 
       <style>{`
-        .user-pill{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.08);padding:4px 10px 4px 12px;border:1px solid rgba(255,255,255,.15);}
-        .user-nome{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;color:rgba(255,255,255,.85);}
-        .user-role{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:2px;text-transform:uppercase;padding:2px 6px;}
-        .role-admin{background:rgba(255,202,3,.2);color:#FFCA03;}
-        .role-editor{background:rgba(255,255,255,.1);color:rgba(255,255,255,.5);}
-        .user-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.6);width:26px;height:26px;cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;transition:all .15s;}
-        .user-loja{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;text-transform:uppercase;padding:2px 7px;background:rgba(255,202,3,.15);color:var(--yellow);border:1px solid rgba(255,202,3,.3);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-        .user-btn:hover{background:rgba(255,255,255,.18);color:#fff;}
-        .cb{width:15px;height:15px;cursor:pointer;accent-color:var(--blue);}
-        tr.row-selected td{background:rgba(30,67,249,.06)!important;}
-        tr.row-selected:hover td{background:rgba(30,67,249,.1)!important;}
-        .bulk-bar{background:var(--navy);border-top:3px solid var(--blue);border-bottom:1px solid rgba(255,255,255,.08);padding:10px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px;animation:slideDown .2s ease;}
-        @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
-        .bulk-info{display:flex;align-items:center;gap:10px;}
-        .bulk-count{font-family:'Bebas Neue',sans-serif;font-size:28px;color:var(--yellow);line-height:1;}
-        .bulk-info span{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.6);}
-        .chip-danger{background:var(--danger)!important;color:#fff!important;border-color:var(--danger)!important;}
-        .chip-danger:hover{background:#c0102a!important;}
-        .chip-danger:disabled{opacity:.6;cursor:not-allowed;}
+        :root{--bg:#0F1117;--surface:#1A1D27;--surface2:#22263A;--border:#2A2D3A;--accent:var(--accent);--text:#E8EAF0;--text2:#B8BDD0;--muted:#8A90A8;--danger:var(--danger);--green:var(--green);}
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:var(--font-display);background:var(--bg);color:var(--text)}
 
-        /* ── Filtros avançados ── */
-        .chip-ativo{border-color:var(--yellow)!important;color:var(--yellow)!important;}
-        .chip-limpar{border-color:var(--danger)!important;color:var(--danger)!important;}
-        .chip-limpar:hover{background:var(--danger)!important;color:#fff!important;}
-        .filtros-panel{background:#04162f;border-bottom:1px solid rgba(255,255,255,.06);padding:14px 24px;}
-        .filtros-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;}
-        .filtro-grupo{display:flex;flex-direction:column;gap:4px;}
-        .filtro-label{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4);}
-        .filtro-sel{padding:6px 9px;border:1px solid rgba(255,255,255,.15);background:#0a1e48;color:rgba(255,255,255,.85);font-size:11px;font-family:'DM Sans',sans-serif;}
-        .filtro-sel:focus{outline:1px solid var(--yellow);outline-offset:-1px;}
-        .filtro-sel option{background:#0D2654;color:#fff;}
+        /* Header */
+        .hdr{background-color:var(--surface);background-image:repeating-linear-gradient(-58deg,transparent 0 11px,oklch(0.656 0.231 29.3 / 8%) 11px 12px);border-bottom:1px solid var(--border);padding:0 24px;height:54px;display:flex;align-items:center;justify-content:space-between;gap:12px;position:sticky;top:0;z-index:90}
+        .hdr-left{display:flex;align-items:center;gap:12px}
+        .hdr-logo{width:34px;height:34px;background:linear-gradient(135deg,var(--accent),var(--accent));display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+        .hdr-eyebrow{font-family:var(--font-mono);font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--muted)}
+        .hdr-title{font-size:16px;font-weight:800;color:var(--text);letter-spacing:.2px}
+        .hdr-right{display:flex;align-items:center;gap:6px}
+        .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text2);padding:5px 12px;font-size:11px;cursor:pointer;transition:all .15s;font-family:var(--font-mono);letter-spacing:1px}
+        .btn-ghost:hover,.btn-ghost.active{border-color:var(--accent);color:var(--accent)}
+        .btn-accent{background:var(--accent);color:#fff;border:none;padding:7px 16px;font-size:12px;font-weight:600;cursor:pointer;transition:background .15s}
+        .btn-nova{background:var(--late);color:#fff;border:none;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;transition:opacity .15s}
+        .btn-nova:hover{opacity:.85}
+        .btn-accent:hover{background:color-mix(in oklch, var(--accent) 85%, black)}
+        .btn-accent:disabled{opacity:.6;cursor:not-allowed}
+        .btn-accent.sm{padding:5px 12px;font-size:11px}
+        .btn-clear{background:transparent;border:1px solid var(--danger);color:var(--danger);padding:5px 10px;font-size:11px;cursor:pointer;font-family:var(--font-mono);letter-spacing:1px}
+        .user-chip{display:flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);padding:4px 10px 4px 12px}
+        .user-chip span:first-child{font-size:12px;font-weight:500;color:var(--text)}
+        .role-tag{font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;padding:2px 6px}
+        .role-admin{background:oklch(from var(--accent) l c h / 0.2);color:var(--accent)}
+        .role-gestor{background:rgba(99,102,241,.2);color:#818CF8}
+        .role-operador{background:rgba(255,255,255,.08);color:var(--text2)}
+        .logout-btn{background:rgba(255,255,255,.06);border:1px solid var(--border);color:var(--text2);width:26px;height:26px;cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;transition:all .15s}
+        .logout-btn:hover{border-color:var(--danger);color:var(--danger)}
 
-        /* ── Colunas ordenáveis ── */
-        .th-sort{cursor:pointer;user-select:none;white-space:nowrap;}
-        .th-sort:hover{color:var(--text);}
+        /* Métricas */
+        .metrics-bar{display:flex;gap:2px;padding:0 0;border-bottom:1px solid var(--border);background-image:repeating-linear-gradient(-58deg,transparent 0 11px,oklch(0.656 0.231 29.3 / 5%) 11px 12px)}
+        .metric{flex:1;padding:14px 20px;background:var(--surface);cursor:default;transition:background .15s;border-bottom:2px solid transparent}
+        .metric:hover{background:var(--surface2)}
+        .metric-val{font-size:28px;font-weight:700;line-height:1;color:var(--text)}
+        .metric-val.sm{font-size:16px;font-weight:600}
+        .metric-lbl{font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-top:4px}
+        .metric-valor{flex:1.5}
 
-        /* ── Revisão editável ── */
-        .rev-hint{font-size:11px;color:rgba(255,255,255,.55);margin-bottom:12px;line-height:1.5}
-        .rev-wrap{overflow-x:auto;max-height:380px;overflow-y:auto;margin-bottom:4px}
+        /* Import panel */
+        .import-panel{background:var(--surface);border-bottom:2px solid var(--accent);padding:20px 24px}
+        .panel-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+        .import-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:16px}
+        .import-col{}
+        .import-label{font-family:var(--font-mono);font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+        .drop-zone{display:flex;flex-direction:column;align-items:center;justify-content:center;border:1px dashed var(--border);padding:24px;cursor:pointer;transition:border-color .15s;min-height:100px}
+        .drop-zone:hover{border-color:var(--accent)}
+        .drop-icon{font-size:24px;margin-bottom:8px}
+        .drop-txt{font-size:12px;color:var(--text2)}
+        .drop-hint{font-size:10px;color:var(--muted);font-family:var(--font-mono);margin-top:4px}
+        .file-ok{font-size:11px;color:var(--green);margin-top:8px;font-family:var(--font-mono)}
+        .map-empty{font-size:12px;color:var(--muted);font-style:italic}
+        .map-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+        .map-lbl{font-size:11px;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .map-arr{color:var(--muted);font-size:12px}
+        .map-sel{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;font-size:11px;flex:1.2}
+        .import-footer{display:flex;align-items:center;justify-content:space-between;padding-top:12px;border-top:1px solid var(--border)}
+        .import-info{font-family:var(--font-mono);font-size:10px;letter-spacing:1px;color:var(--muted)}
+
+        /* Revisão */
+        .rev-hint{font-size:11px;color:var(--text2);margin-bottom:12px}
+        .rev-wrap{overflow-x:auto;max-height:340px;overflow-y:auto;margin-bottom:12px}
         .rev-table{width:100%;border-collapse:collapse;font-size:11px;min-width:800px}
-        .rev-table thead tr{background:rgba(255,255,255,.08);position:sticky;top:0;z-index:2}
-        .rev-table th{padding:7px 10px;text-align:left;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.5);border-bottom:1px solid rgba(255,255,255,.1)}
-        .rev-table td{padding:4px 6px;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:middle}
-        .rev-row-alerta{background:rgba(255,202,3,.07)}
-        .rev-row-alerta:hover{background:rgba(255,202,3,.12)!important}
-        .rev-num{font-family:'DM Mono',monospace;font-size:9px;color:rgba(255,255,255,.3);width:28px;text-align:center}
-        .rev-input{width:100%;padding:5px 7px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.9);font-size:11px;font-family:'DM Sans',sans-serif;}
-        .rev-input:focus{outline:1px solid var(--yellow);background:rgba(255,202,3,.08)}
-        .rev-vazio{border-color:rgba(255,202,3,.5);background:rgba(255,202,3,.06)}
-        .rev-vazio::placeholder{color:rgba(255,202,3,.6)}
-        .rev-original{font-size:10px;color:rgba(255,255,255,.3);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'DM Mono',monospace}
+        .rev-table thead tr{background:var(--surface2);position:sticky;top:0;z-index:2}
+        .rev-table th{padding:8px 10px;text-align:left;font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+        .rev-table td{padding:4px 6px;border-bottom:1px solid var(--border)}
+        .rev-num{font-family:var(--font-mono);font-size:9px;color:var(--muted);width:28px;text-align:center}
+        .rev-input{width:100%;padding:5px 7px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text);font-size:11px}
+        .rev-input:focus{outline:1px solid var(--accent);background:oklch(from var(--accent) l c h / 0.06)}
+        .rev-vazio{border-color:rgba(249,115,22,.5)}
 
-        /* ── SLA ── */
-        .metric.sla{border-color:#8A96B0;}
-        .sla-hint{background:var(--navy);padding:0 24px 14px;font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;color:rgba(255,255,255,.3);}
-        tr.row-atrasada td{background:rgba(232,51,74,.04);}
-        tr.row-atrasada:hover td{background:rgba(232,51,74,.08)!important;}
-        tr.row-atrasada .id-cell{border-left:3px solid var(--danger);padding-left:8px;}
-        .sla-modal-box{padding:10px 14px;background:var(--off);border-left:3px solid var(--blue);margin-top:2px;}
-        .sla-modal-box.sla-estourado{background:#FEF2F2;border-left-color:var(--danger);}
-        .sla-modal-label{font-family:'DM Mono',monospace;font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
-        .sla-modal-valor{font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px;}
-        .sla-modal-box.sla-estourado .sla-modal-valor{color:var(--danger);}
-        .sla-modal-hint{font-size:11px;color:var(--muted);}
+        /* Toolbar */
+        .toolbar{display:flex;align-items:center;gap:8px;padding:12px 24px;background:var(--surface);border-bottom:1px solid var(--border)}
+        .search-input{flex:1;max-width:400px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 12px;font-size:12px;transition:border-color .15s}
+        .search-input:focus{outline:none;border-color:var(--accent)}
+        .loading-txt{font-family:var(--font-mono);font-size:9px;color:var(--muted);letter-spacing:2px}
+        .result-count{margin-left:auto;font-family:var(--font-mono);font-size:9px;color:var(--muted);letter-spacing:2px}
 
-        /* ── Texto original ERP somente leitura ── */
-        .erp-original-box{padding:10px 12px;background:#F9FAFE;border:1px solid var(--border);border-left:3px solid var(--muted);font-size:11px;color:var(--text2);font-family:'DM Mono',monospace;line-height:1.6;word-break:break-word;user-select:text;cursor:default;}
+        /* Filter panel */
+        .filter-panel{background:var(--surface2);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;gap:16px;flex-wrap:wrap}
+        .filter-group{display:flex;flex-direction:column;gap:4px;min-width:180px}
+        .filter-group label{font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--muted)}
+        .filter-group input,.filter-group select{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 10px;font-size:11px}
+        .filter-group input:focus,.filter-group select:focus{outline:none;border-color:var(--accent)}
+        .filter-group select option{background:var(--surface)}
 
-        /* ── Cards clicáveis ── */
-        .metric.clickable{cursor:pointer;transition:transform .12s,background .15s;}
-        .metric.clickable:hover{background:rgba(255,255,255,.09);}
-        .metric.clickable:active{transform:scale(.97);}
-        .metric.active{outline:2px solid var(--yellow);outline-offset:-2px;}
+        /* Tabela */
+        .tbl-wrap{overflow-x:auto;padding:0 24px 24px}
+        .tbl{width:100%;border-collapse:collapse;font-size:12px;margin-top:0}
+        .tbl thead tr{border-bottom:1px solid var(--border)}
+        .tbl th{padding:10px 12px;text-align:left;font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+        .tbl-row td{padding:12px;border-bottom:1px solid var(--border);vertical-align:middle;background:transparent;transition:background .1s}
+        .tbl-row:hover td{background:var(--surface)}
+        .id-cell{font-family:var(--font-mono);font-size:10px;color:var(--muted);white-space:nowrap}
+        .cell-primary{font-weight:500;color:var(--text);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .cell-sec{color:var(--text2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+        .cell-mono{font-family:var(--font-mono);font-size:11px;color:var(--text2);white-space:nowrap}
+        .cell-empty{color:var(--muted);font-style:italic}
+        .cell-actions{white-space:nowrap;display:flex;gap:4px}
+        .status-pill{display:inline-flex;padding:3px 10px;font-family:var(--font-mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;font-weight:700;border:1px solid;white-space:nowrap}
+        .act-btn{background:none;border:1px solid var(--border);color:var(--muted);padding:3px 9px;font-size:10px;cursor:pointer;font-family:var(--font-mono);letter-spacing:1px;transition:all .15s}
+        .act-btn:hover{border-color:var(--accent);color:var(--accent)}
+        .act-btn.danger:hover{border-color:var(--danger);color:var(--danger)}
+        .empty-row{text-align:center;padding:40px;color:var(--muted);font-size:12px;background-image:repeating-linear-gradient(-58deg,transparent 0 11px,oklch(0.656 0.231 29.3 / 4%) 11px 12px)}
+
+        /* Modal */
+        .overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:200;padding:24px}
+        .modal{background:var(--surface);border:1px solid var(--border);border-top:2px solid var(--accent);width:100%;max-width:640px;max-height:90vh;display:flex;flex-direction:column}
+        .modal-hdr{padding:20px 24px 16px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-shrink:0}
+        .modal-eyebrow{font-family:var(--font-mono);font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+        .modal-title{font-size:18px;font-weight:700;color:var(--signal)}
+        .modal-close{background:none;border:1px solid var(--border);color:var(--text2);width:28px;height:28px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+        .modal-close:hover{border-color:var(--danger);color:var(--danger)}
+        .modal-body{padding:20px 24px;overflow-y:auto;flex:1}
+        .modal-section{font-family:var(--font-mono);font-size:8px;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+        .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .fg{display:flex;flex-direction:column;gap:4px}
+        .fg.full{grid-column:1/-1}
+        .fg label{font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--muted)}
+        .fg input,.fg select,.fg textarea{background:#13161F;border:1px solid #1E2130;color:var(--text);padding:8px 10px;font-size:12px;transition:border-color .15s}
+        .fg textarea{resize:vertical;min-height:80px}
+        .fg input:focus,.fg select:focus,.fg textarea:focus{outline:none;border-color:var(--accent)}
+        .fg select option{background:var(--surface)}
+        .hist-list{list-style:none;margin-bottom:8px}
+        .hist-item{padding:6px 10px;font-size:11px;color:var(--text2);border-left:2px solid var(--border);margin-bottom:4px;font-family:var(--font-mono)}
+        .hist-input{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-size:12px}
+        .hist-input:focus{outline:none;border-color:var(--accent)}
+        .modal-foot{padding:16px 24px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;flex-shrink:0}
+
+        /* Toast */
+        .toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);color:var(--text);padding:12px 20px;font-size:12px;opacity:0;transform:translateY(10px);transition:all .25s;pointer-events:none;z-index:999}
+        .toast.show{opacity:1;transform:translateY(0)}
+
+        @media(max-width:768px){.import-grid{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.metrics-bar{flex-wrap:wrap}}
+        .btn-avancar{background:transparent;border:1px solid;padding:6px 12px;font-size:11px;cursor:pointer;font-weight:600;transition:all .15s;text-align:left}
+        .btn-avancar:hover{opacity:.8}
+        .status-atual-pill{}
+
+        /* Anexos */
+        .anexos-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+        .btn-anexar{display:inline-flex;align-items:center;padding:7px 14px;background:var(--surface2);border:1px solid var(--border);color:var(--text2);font-size:11px;cursor:pointer;transition:all .15s;font-family:var(--font-display)}
+        .btn-anexar:hover{border-color:var(--accent);color:var(--accent)}
+        .anexo-hint{font-size:10px;color:var(--muted);font-family:var(--font-mono)}
+        .anexos-empty{font-size:11px;color:var(--muted);font-style:italic;padding:12px;text-align:center;border:1px dashed var(--border)}
+        .anexos-list{display:flex;flex-direction:column;gap:6px}
+        .anexo-row{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border:1px solid var(--border)}
+        .anexo-icon{font-size:18px;flex-shrink:0}
+        .anexo-info{flex:1;min-width:0}
+        .anexo-nome{font-size:12px;font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .anexo-meta{font-size:10px;color:var(--muted);font-family:var(--font-mono);margin-top:2px}
+        .anexo-actions{display:flex;gap:4px;flex-shrink:0}
+
+        /* Parcelas */
+        .parcelas-toolbar{margin-bottom:12px;display:flex;flex-direction:column;gap:8px}
+        .parcela-input-qtd{width:140px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;font-size:12px}
+        .parcela-input-qtd:focus{outline:none;border-color:var(--accent)}
+        .btn-parcela-gerar{background:var(--accent);color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:background .15s}
+        .btn-parcela-gerar:hover{background:color-mix(in oklch, var(--accent) 85%, black)}
+        .btn-parcela-add{background:transparent;border:1px solid var(--border);color:var(--text2);padding:6px 14px;font-size:12px;cursor:pointer;transition:all .15s}
+        .btn-parcela-add:hover{border-color:var(--accent);color:var(--accent)}
+        .parcela-hint{font-size:11px;color:var(--muted)}
+        .parcelas-resumo{font-family:var(--font-mono);font-size:10px;letter-spacing:1px;color:var(--muted);padding:6px 10px;background:var(--surface2);border-left:2px solid var(--accent)}
+        .parcelas-wrap{overflow-x:auto;max-height:300px;overflow-y:auto;border:1px solid var(--border)}
+        .parcelas-table{width:100%;border-collapse:collapse;font-size:12px;min-width:500px}
+        .parcelas-table thead tr{background:var(--surface2);position:sticky;top:0}
+        .parcelas-table th{padding:8px 10px;text-align:left;font-family:var(--font-mono);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+        .parcela-row td{padding:4px 8px;border-bottom:1px solid var(--border);vertical-align:middle}
+        .parcela-row.parcela-pago td{opacity:.6}
+        .parcela-num{font-family:var(--font-mono);font-size:10px;color:var(--muted);width:28px;text-align:center}
+        .parcela-field{width:100%;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text);padding:5px 7px;font-size:11px}
+        .parcela-field:focus{outline:none;border-color:var(--accent)}
+        .parcela-status{background:var(--surface2);border:1px solid var(--border);font-size:10px;padding:4px 6px;cursor:pointer;font-weight:600}
+        .parcela-status.status-pago{color:var(--green);border-color:rgba(34,197,94,.3)}
+        .parcela-status.status-pendente{color:var(--text2)}
+        .parcela-del{background:none;border:1px solid var(--border);color:var(--muted);width:24px;height:24px;cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;transition:all .15s}
+        .parcela-del:hover{border-color:var(--danger);color:var(--danger)}
+        .parcelas-empty{font-size:11px;color:var(--muted);font-style:italic;padding:16px;text-align:center;border:1px dashed var(--border)}
       `}</style>
     </>
   );
